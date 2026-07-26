@@ -409,6 +409,7 @@ void SideBarWidget::initDefaultModel()
                   << DefaultGroup::kNetwork
                   << DefaultGroup::kTag
                   << DefaultGroup::kOther
+                  << DefaultGroup::kHistory
                   << DefaultGroup::kNotExistedGroup;
 
     groupDisplayName.insert(DefaultGroup::kCommon, tr("Quick access"));
@@ -416,6 +417,7 @@ void SideBarWidget::initDefaultModel()
     groupDisplayName.insert(DefaultGroup::kNetwork, tr("Network"));
     groupDisplayName.insert(DefaultGroup::kTag, tr("Tag"));
     groupDisplayName.insert(DefaultGroup::kOther, tr("Other"));
+    groupDisplayName.insert(DefaultGroup::kHistory, tr("History"));
     groupDisplayName.insert(DefaultGroup::kNotExistedGroup, tr("Unknown Group"));
 
     // create default separator item.
