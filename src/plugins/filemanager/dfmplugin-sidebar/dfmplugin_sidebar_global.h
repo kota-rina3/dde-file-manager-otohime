@@ -30,6 +30,7 @@ inline constexpr char kDevice[] { "Group_Device" };
 inline constexpr char kNetwork[] { "Group_Network" };
 inline constexpr char kTag[] { "Group_Tag" };
 inline constexpr char kOther[] { "Group_Other" };
+inline constexpr char kHistory[] { "Group_History" };
 inline constexpr char kNotExistedGroup[] { "__not_existed_group" };
 }   // namespace DefaultGroup
 
