@@ -7,6 +7,7 @@
 #include "browserpage.h"
 #include "sheetrenderer.h"
 #include "docsheet.h"
+#include "global.h"
 
 #include <DGuiApplicationHelper>
 
