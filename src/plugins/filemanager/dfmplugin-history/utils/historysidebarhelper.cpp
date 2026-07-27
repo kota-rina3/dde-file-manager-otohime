@@ -14,6 +14,9 @@
 #include <QFileInfo>
 #include <QDesktopServices>
 #include <QIcon>
+#include <QPoint>
+
+#include <functional>
 
 using namespace dfmplugin_history;
 DFMBASE_USE_NAMESPACE

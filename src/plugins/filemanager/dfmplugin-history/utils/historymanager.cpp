@@ -6,13 +6,8 @@
 
 #include <dfm-base/base/application/application.h>
 #include <dfm-base/base/application/settings.h>
-#include <dfm-base/utils/systempathutil.h>
 
 #include <QFileInfo>
-#include <QDir>
-#include <QJsonDocument>
-#include <QJsonArray>
-#include <QJsonObject>
 
 using namespace dfmplugin_history;
 DFMBASE_USE_NAMESPACE

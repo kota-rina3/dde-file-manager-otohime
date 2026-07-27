@@ -6,10 +6,8 @@
 #include "utils/historymanager.h"
 
 #include <dfm-base/dfm_event_defines.h>
-#include <dfm-base/utils/systempathutil.h>
 
 #include <QFileInfo>
-#include <QDir>
 
 using namespace dfmplugin_history;
 DFMBASE_USE_NAMESPACE

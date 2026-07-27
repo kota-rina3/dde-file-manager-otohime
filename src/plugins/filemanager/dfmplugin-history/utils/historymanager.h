@@ -10,7 +10,6 @@
 #include <QObject>
 #include <QUrl>
 #include <QList>
-#include <QPair>
 #include <QDateTime>
 
 namespace dfmplugin_history {

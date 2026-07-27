@@ -9,13 +9,10 @@ include(DFMPluginConfig)
 # Function to setup history plugin dependencies
 function(dfm_setup_history_dependencies target_name)
     message(STATUS "DFM: Setting up history plugin dependencies for: ${target_name}")
-    
-    # Find required packages
-    find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
-    
-    # Apply default plugin configuration first
+
+    # Apply default plugin configuration (links DFM6::base and DFM6::framework)
     dfm_apply_default_plugin_config(${target_name})
-    
+
     message(STATUS "DFM: History plugin dependencies configured successfully")
 endfunction()
 

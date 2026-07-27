@@ -9,6 +9,7 @@
 
 #include <QObject>
 #include <QUrl>
+#include <QPoint>
 
 namespace dfmplugin_history {
 
