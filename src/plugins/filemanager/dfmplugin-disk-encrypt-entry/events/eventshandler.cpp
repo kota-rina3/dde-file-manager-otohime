@@ -19,10 +19,18 @@
 #include <QDBusInterface>
 #include <QDBusPendingCall>
 #include <QDBusReply>
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QTimer>
 
 #include <DDialog>
 #include <DDBusSender>
 #include <DUtil>
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 
 #define DDE_SHUTDOWN_SERVICE "org.deepin.dde.ShutdownFront1"
 #define DDE_SHUTDOWN_PATH "/org/deepin/dde/ShutdownFront1"
@@ -74,6 +82,41 @@ void EventsHandler::hookEvents()
 {
     dpfHookSequence->follow("dfmplugin_computer", "hook_Device_AcquireDevPwd",
                             this, &EventsHandler::onAcquireDevicePwd);
+}
+
+void EventsHandler::checkPendingOverlayDMNotify()
+{
+    QFile file(disk_encrypt::kOverlayDMNotifyFile);
+    if (!file.exists()) {
+        fmInfo() << "No pending overlay DM notification file found";
+        return;
+    }
+
+    if (!file.open(QIODevice::ReadOnly)) {
+        fmWarning() << "Failed to open pending notification file:" << disk_encrypt::kOverlayDMNotifyFile;
+        return;
+    }
+
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    file.close();
+
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        fmWarning() << "Failed to parse pending notification JSON:" << parseError.errorString();
+        QFile::remove(disk_encrypt::kOverlayDMNotifyFile);
+        return;
+    }
+
+    QJsonObject obj = doc.object();
+    bool enabled = obj.value("enabled").toBool();
+    int result = obj.value("result").toInt();
+
+    QFile::remove(disk_encrypt::kOverlayDMNotifyFile);
+    fmInfo() << "Found pending overlay DM notification, enabled:" << enabled << "result:" << result;
+
+    QTimer::singleShot(2000, this, [this, enabled, result]() {
+        onOverlayDMModeChanged(enabled, result);
+    });
 }
 
 /**
@@ -145,16 +188,15 @@ int EventsHandler::deviceEncryptStatus(const QString &device)
 
 void EventsHandler::resumeEncrypt(const QString &device)
 {
-    QDBusInterface iface(kDaemonBusName,
-                         kDaemonBusPath,
-                         kDaemonBusIface,
-                         QDBusConnection::systemBus());
+    CREATE_DAEMON_INTERFACE(iface);
+    iface.setTimeout(kTPMDBusTimeoutMs);
     iface.asyncCall("ResumeEncryption", QVariantMap { { encrypt_param_keys::kKeyDevice, device } });
 }
 
 QString EventsHandler::holderDevice(const QString &device)
 {
     CREATE_DAEMON_INTERFACE(iface);
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmWarning() << "Failed to create DBus interface for HolderDevice, service may be unavailable, using original device";
         return device;
@@ -215,7 +257,6 @@ void EventsHandler::onEncryptFinished(const QVariantMap &result)
         ignoreParamRequest();
         return;
     case kSuccess:
-    case KErrorRequestExportRecKey:
         title = tr("Encrypt done");
         msg = tr("Partition %1 has been encrypted").arg(device);
         success = true;
@@ -235,11 +276,19 @@ void EventsHandler::onEncryptFinished(const QVariantMap &result)
         dialog_utils::showDialog(title, msg);
     else {
         dialog->showResultPage(success, title, msg);
-        if (code == -KErrorRequestExportRecKey) {
-            auto recKey = result.value(encrypt_param_keys::kKeyRecoveryKey).toString();
-            dialog->setRecoveryKey(recKey, dev);
-            dialog->showExportPage();
+
+        // The service now always returns the recovery key (when generated) via
+        // kKeyRecoveryKey; write it to the user-selected export path in the user
+        // session, falling back to the re-export page only when the write fails.
+        auto recKey = result.value(encrypt_param_keys::kKeyRecoveryKey).toString();
+        if (!recKey.isEmpty()) {
+            auto exportPath = exportPaths.take(dev);
+            if (exportPath.isEmpty() || !saveRecoveryKeyToFile(recKey, dev, exportPath)) {
+                dialog->setRecoveryKey(recKey, dev);
+                dialog->showExportPage();
+            }
         }
+
         dialog->raise();
     }
 
@@ -280,7 +329,7 @@ void EventsHandler::onChgPwdFinished(const QVariantMap &result)
 
 void EventsHandler::onRequestAuthArgs(const QVariantMap &devInfo)
 {
-    qApp->restoreOverrideCursor();
+    fmDebug() << "[EventsHandler::onRequestAuthArgs] enter";
 
     QString devPath = devInfo.value(encrypt_param_keys::kKeyDevice).toString();
     if (devPath.isEmpty()) {
@@ -293,11 +342,13 @@ void EventsHandler::onRequestAuthArgs(const QVariantMap &devInfo)
         return;
     }
 
+    qApp->restoreOverrideCursor();
+
     QString objPath = "/org/freedesktop/UDisks2/block_devices/" + devPath.mid(5);
     auto blkDev = device_utils::createBlockDevice(objPath);
     auto dlg = new EncryptParamsInputDialog(devInfo, qApp->activeWindow());
     encryptInputs.insert(devPath, dlg);
-
+    fmDebug() << "[EventsHandler::onRequestAuthArgs] Had new Encrypt params input dialog.";
     connect(dlg, &DDialog::finished, this, [=](auto ret) {
         if (ret != QDialog::Accepted) {
             fmInfo() << "User cancelled auth input for device:" << devPath;
@@ -305,7 +356,13 @@ void EventsHandler::onRequestAuthArgs(const QVariantMap &devInfo)
             encryptInputs.take(devPath)->deleteLater();   // also will be deleted when encryption started.
         } else {
             fmInfo() << "User provided auth input for device:" << devPath << "proceeding with re-encryption";
-            if (!DiskEncryptMenuScene::doReencryptDevice(dlg->getInputs())) {
+            auto inputs = dlg->getInputs();
+            // Remember the user-selected export path so the recovery key can be
+            // written by the front-end (in the user session) once the service
+            // returns it via EncryptResult.
+            if (!inputs.exportPath.isEmpty())
+                exportPaths.insert(devPath, inputs.exportPath);
+            if (!DiskEncryptMenuScene::doReencryptDevice(inputs)) {
                 ignoreParamRequest();
                 if (encryptInputs.contains(devPath))
                     encryptInputs.take(devPath)->deleteLater();
@@ -384,14 +441,24 @@ bool EventsHandler::onAcquireDevicePwd(const QString &dev, QString *pwd, bool *c
 
     // test tpm
     bool testTPM = (type == kPin || type == kTpm);
-    if (testTPM && tpm_utils::checkTPM() != 0) {
-        fmWarning() << "TPM service is not available for device:" << dev;
-        int ret = dialog_utils::showDialog(tr("Error"), tr("TPM status is abnormal, please use the recovery key to unlock it"));
-        // unlock by recovery key.
-        if (ret == 0)
-            *pwd = acquirePassphraseByRec(dev, *cancelled);
+    if (testTPM) {
+        bool authFailed = false;
+        int tpmRet = tpm_utils::checkTPM(&authFailed);
+        if (authFailed) {
+            // PolicyKit authorization failed/cancelled by user, treat as cancel this unlock.
+            fmInfo() << "TPM authorization cancelled by user for device:" << dev;
+            *cancelled = true;
+            return true;
+        }
+        if (tpmRet != 0) {
+            fmWarning() << "TPM service is not available for device:" << dev;
+            int ret = dialog_utils::showDialog(tr("Error"), tr("TPM status is abnormal, please use the recovery key to unlock it"));
+            // unlock by recovery key.
+            if (ret == 0)
+                *pwd = acquirePassphraseByRec(dev, *cancelled);
 
-        return true;
+            return true;
+        }
     }
 
     switch (type) {
@@ -719,14 +786,55 @@ void EventsHandler::setAutoStartDFM(bool enable)
     }
 }
 
+bool EventsHandler::saveRecoveryKeyToFile(const QString &recKey, const QString &dev, const QString &exportPath)
+{
+    // Align with EncryptProgressDialog::saveRecKey(): write <exportPath>/<dev>_recovery_key.txt.
+    // The recovery key is a secret, so O_NOFOLLOW rejects a symlink at the target
+    // path, 0600 keeps the file private, and fsync restores the durability that the
+    // removed service-side writer used to guarantee.
+    const QString fileName = QString("%1/%2_recovery_key.txt").arg(exportPath).arg(dev.mid(5));
+
+    int fd = ::open(fileName.toLocal8Bit().constData(),
+                    O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        fmCritical() << "Failed to create recovery key file:" << fileName << "errno:" << errno;
+        return false;
+    }
+
+    const QByteArray keyData = recKey.toLocal8Bit();
+    const ssize_t written = ::write(fd, keyData.constData(), keyData.size());
+    if (written != keyData.size()) {
+        fmCritical() << "Failed to write recovery key completely:" << fileName;
+        ::close(fd);
+        ::unlink(fileName.toLocal8Bit().constData());
+        return false;
+    }
+
+    ::fsync(fd);
+    ::close(fd);
+    fmInfo() << "Recovery key successfully saved to:" << fileName;
+    return true;
+}
+
 void EventsHandler::onOverlayDMModeChanged(bool enabled, int result)
 {
     fmInfo() << "Overlay DM mode changed, enabled:" << enabled << "result:" << result;
 
-    QString title, message, icon;
-    bool isSuccess = (result == 0);
+    QFile::remove(disk_encrypt::kOverlayDMNotifyFile);
 
-    if (isSuccess) {
+    QString title, message, icon;
+
+    if (result == disk_encrypt::OverlayDMRolledBackInterrupted) {
+        // Previous enable/disable was interrupted before initramfs finished and has
+        // been rolled back to the disabled state; advise the user to reboot.
+        icon = "dde-file-manager";
+        title = tr("Partition Encryption Non-Reboot Mode Rolled Back");
+        message = tr("A previous configuration of Partition Encryption Non-Reboot Mode "
+                     "was interrupted and has been rolled back to the disabled state. "
+                     "Please reboot your system to ensure consistency. You may re-enable "
+                     "the feature after reboot if needed.");
+        fmInfo() << "Sending rolled-back notification:" << title << message;
+    } else if (result == disk_encrypt::OverlayDMSuccess) {
         // Operation succeeded, reboot required
         icon = "dde-file-manager";
         if (enabled) {

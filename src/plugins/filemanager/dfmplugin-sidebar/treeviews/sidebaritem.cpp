@@ -30,6 +30,7 @@ SideBarItem::SideBarItem(const SideBarItem &item)
     setIcon(item.icon());
     setUrl(item.url());
     setGroup(item.group());
+    setExpandable(item.isExpandable());
     setText(item.text());
 
     setData(kSidebarItem, kItemTypeRole);
@@ -69,6 +70,7 @@ void SideBarItem::setUrl(const QUrl &url)
 void SideBarItem::setIcon(const QIcon &icon)
 {
     const auto &iconName = icon.name();
+    setData(iconName, Roles::kItemIconNameRole);
     DDciIcon dciIcon = DDciIcon::fromTheme(iconName);
     if (!dciIcon.isNull())
         setDciIcon(dciIcon);
@@ -91,6 +93,16 @@ void SideBarItem::setHiiden(bool hidden)
     setData(hidden, Roles::kItemHiddenRole);
 }
 
+bool SideBarItem::isExpandable() const
+{
+    return data(Roles::kItemExpandableRole).toBool();
+}
+
+void SideBarItem::setExpandable(bool expandable)
+{
+    setData(expandable, Roles::kItemExpandableRole);
+}
+
 QString SideBarItem::subGourp() const
 {
     return itemInfo().subGroup;
@@ -99,7 +111,7 @@ QString SideBarItem::subGourp() const
 ItemInfo SideBarItem::itemInfo() const
 {
     // if this is storage as a member variable, click item after dragged, dfm crash.
-    return SideBarInfoCacheMananger::instance()->itemInfo(url());
+    return SideBarInfoCacheMananger::instance()->itemInfo(group(), url());
 }
 
 QString SideBarItem::group() const

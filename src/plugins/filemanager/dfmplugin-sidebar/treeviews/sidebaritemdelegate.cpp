@@ -12,6 +12,7 @@
 #include <dfm-base/base/schemefactory.h>
 #include <dfm-base/utils/universalutils.h>
 #include <dfm-base/utils/fileutils.h>
+#include <dfm-base/utils/iconcachemanager.h>
 #include <dfm-base/dbusservice/global_server_defines.h>
 #include <dfm-base/base/device/deviceutils.h>
 #include <dfm-base/base/device/devicealiasmanager.h>
@@ -30,7 +31,6 @@
 #include <QDebug>
 #include <QApplication>
 #include <qdrawutil.h>
-#include <QImage>
 #include <QFontMetrics>
 #include <QEvent>
 #include <QMouseEvent>
@@ -50,6 +50,7 @@ DGUI_USE_NAMESPACE
 
 static constexpr int kRadius = 8;
 static constexpr int kExpandIconSize = 12;
+static constexpr int kSeparatorExpandIconSize = 14;
 static constexpr int kItemMargin = 10;
 static constexpr int kItemIconSize = 16;
 static constexpr int kEjectIconSize = 16;
@@ -58,6 +59,7 @@ static constexpr int kDefaultMaxLength = 40;
 
 #ifdef DTKWIDGET_CLASS_DSizeMode
 static constexpr int kCompactExpandIconSize = 10;
+static constexpr int kCompactSeparatorExpandIconSize = 12;
 static constexpr int kCompactModeIcon = 16;
 #endif
 
@@ -74,9 +76,37 @@ void paintSeparator(QPainter *painter, const QStyleOptionViewItem &option)
 }
 }   // namespace GlobalPrivate
 
+QString SideBarItemDelegate::makeIconCacheKey(const QSize &size,
+                                             DTK_GUI_NAMESPACE::DDciIcon::Theme theme,
+                                             DTK_GUI_NAMESPACE::DDciIcon::Mode mode,
+                                             const QString &iconId,
+                                             const QColor &foreground) const
+{
+    return QString::asprintf("%s|%dx%d|%d|%d|%08x", iconId.toUtf8().constData(),
+                             size.width(), size.height(), static_cast<int>(theme),
+                             static_cast<int>(mode), foreground.rgba());
+}
+
+void SideBarItemDelegate::clearIconCache()
+{
+    m_iconCache.clear();
+}
+
+void SideBarItemDelegate::invalidateIconCache(const QUrl &url)
+{
+    Q_UNUSED(url);
+    // Cache keys are now keyed by icon name (see drawIcon/drawDciIcon), not by
+    // url, so per-url invalidation is no longer possible. The cache is capped at
+    // 50 entries, so a full clear is cheap and avoids stale pixmaps when an
+    // item's icon changes.
+    clearIconCache();
+}
+
 SideBarItemDelegate::SideBarItemDelegate(QAbstractItemView *parent)
     : DStyledItemDelegate(parent)
 {
+    connect(DGuiApplicationHelper::instance(), &DGuiApplicationHelper::paletteTypeChanged,
+            this, [this]() { clearIconCache(); });
 }
 
 void SideBarItemDelegate::paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const
@@ -94,12 +124,27 @@ void SideBarItemDelegate::paint(QPainter *painter, const QStyleOptionViewItem &o
         opt.state &= (~QStyle::State_Active);
 
     const bool isActive = opt.widget && opt.widget->isActiveWindow();
+    SideBarView *sidebarView = dynamic_cast<SideBarView *>(this->parent());
+    const bool isDragPreview = sidebarView && sidebarView->isRenderingDragPreview();
+    if (isDragPreview)
+        opt.state &= ~(QStyle::State_Selected | QStyle::State_MouseOver | QStyle::State_Sunken | QStyle::State_HasFocus);
 
     painter->setRenderHint(QPainter::Antialiasing);
-    painter->setClipRect(opt.rect);
-
-    if (!option.widget)
+    if (!option.widget) {
+        painter->restore();
         return;
+    }
+
+    const int dragOffset = sidebarView && !isDragPreview
+            ? sidebarView->dragItemVerticalOffset(index, opt.rect.height())
+            : 0;
+    if (dragOffset != 0)
+        opt.rect.translate(0, dragOffset);
+
+    if (sidebarView && !isDragPreview && dragOffset != 0)
+        painter->setClipRect(sidebarView->viewport()->rect());
+    else
+        painter->setClipRect(opt.rect);
 
     DPalette palette(DPaletteHelper::instance()->palette(option.widget));
     auto widgetColor = option.widget->palette().base().color();
@@ -116,43 +161,47 @@ void SideBarItemDelegate::paint(QPainter *painter, const QStyleOptionViewItem &o
     QPoint dw = QPoint(-12, 0);
     bool selected = opt.state.testFlag(QStyle::State_Selected);
     QRect r(itemRect.topLeft() + dx, itemRect.bottomRight() + dw);
-    SideBarView *sidebarView = dynamic_cast<SideBarView *>(this->parent());
-
-    bool isDragedItem = sidebarView->isSideBarItemDragged();
-    bool isDropTarget = sidebarView->isDropTarget(index);
+    const bool isDragedItem = sidebarView && sidebarView->isSideBarItemDragged();
+    const bool isDropTarget = sidebarView && sidebarView->isDropTarget(index);
+    const bool isDraggedSource = sidebarView && sidebarView->isDraggedSource(index);
     bool keepDrawingHighlighted = false;
     const auto &itemUrl = index.data(SideBarItem::kItemUrlRole).toUrl();
-    bool isUrlEqual = UniversalUtils::urlEquals(itemUrl, sidebarView->currentUrl());
+    bool isUrlEqual = sidebarView && UniversalUtils::urlEquals(itemUrl, sidebarView->currentUrl());
     SideBarItem *subItem = dynamic_cast<SideBarItem *>(item);
     if (!isUrlEqual && subItem) {
-        bool foundByCb = subItem->itemInfo().findMeCb && subItem->itemInfo().findMeCb(subItem->url(), sidebarView->currentUrl());
-        if (foundByCb || UniversalUtils::urlEquals(subItem->url(), sidebarView->currentUrl()))
+        const bool foundByCb = sidebarView && subItem->itemInfo().findMeCb
+                && subItem->itemInfo().findMeCb(subItem->url(), sidebarView->currentUrl());
+        if (foundByCb || (sidebarView && UniversalUtils::urlEquals(subItem->url(), sidebarView->currentUrl())))
             isUrlEqual = true;
     }
-    bool isDraggingItemNotHighlighted = selected && !isUrlEqual;
-    if (isUrlEqual) {
+    if (isUrlEqual && sidebarView && sidebarView->isCurrentUrlHighlightIndex(index)) {
         // If the dragging and moving source item is not the current highlighted one,
         // the highlighted one must be keep its state.
         keepDrawingHighlighted = true;
     }
+    const bool suppressDraggedSelection = isDragPreview || (isDragedItem && isDraggedSource);
+    if (suppressDraggedSelection)
+        keepDrawingHighlighted = false;
+    const bool isDraggingItemNotHighlighted = !suppressDraggedSelection && selected && !isUrlEqual;
+    const bool hideDraggedSource = isDragedItem && isDraggedSource && !isDragPreview;
 
-    // Draw the background color when dragging files, rather than when dragging an item
-    if ((selected && isDragedItem) || keepDrawingHighlighted) {   // Draw selected background
-        QColor bgColor;
-        if (isDraggingItemNotHighlighted) {
-            if (DGuiApplicationHelper::instance()->themeType() == DGuiApplicationHelper::DarkType)
-                bgColor = DGuiApplicationHelper::adjustColor(widgetColor, 0, 0, 5, 0, 0, 0, 0);
-            else
-                bgColor = QColor(230, 230, 230);
-        } else {
-            bgColor = option.palette.color(QPalette::Active, QPalette::Highlight);
-            if (!isActive)
-                bgColor.setAlpha(102);
-        }
+    if (hideDraggedSource) {
+        painter->restore();
+        return;
+    }
+
+    // Draw the background color when dragging files, rather than when dragging an item.
+    // When the item itself is being dragged, the background is kept transparent.
+    if (keepDrawingHighlighted && !suppressDraggedSelection) {   // Draw selected background for the current highlighted item
+        QColor bgColor = option.palette.color(QPalette::Active, QPalette::Highlight);
+        if (!isActive)
+            bgColor.setAlpha(102);
 
         painter->setBrush(bgColor);
         painter->setPen(Qt::NoPen);
         painter->drawRoundedRect(r, kRadius, kRadius);
+    } else if (selected && isDragedItem) {
+        // Do nothing — keep background transparent when dragging the item
     } else if (!isDragedItem && (opt.state.testFlag(QStyle::State_MouseOver) || isDropTarget)) {   // Draw mouse over background
         if (item->sizeHint() != QSize(kEmptyItemSize, kEmptyItemSize))
             drawMouseHoverBackground(painter, palette, r, widgetColor);
@@ -183,8 +232,11 @@ void SideBarItemDelegate::paint(QPainter *painter, const QStyleOptionViewItem &o
     QIcon::Mode iconMode = QIcon::Normal;
     if (!(option.state.testFlag(QStyle::State_Enabled)))
         iconMode = QIcon::Disabled;
-    if (!isDraggingItemNotHighlighted && (selected || keepDrawingHighlighted))
+    if (!suppressDraggedSelection && !isDraggingItemNotHighlighted && (selected || keepDrawingHighlighted))
         iconMode = QIcon::Selected;
+    bool isExpandable = sidebarItem && sidebarItem->isExpandable();
+    if (isExpandable)
+        drawExpandIndicator(painter, itemRect, true, index, keepDrawingHighlighted);
     if (opt.features & QStyleOptionViewItem::HasDecoration)
         drawIcon(opt, painter, index, itemRect, isEjectable, iconSize, iconMode, cg, keepDrawingHighlighted);
 
@@ -219,7 +271,7 @@ void SideBarItemDelegate::paint(QPainter *painter, const QStyleOptionViewItem &o
     qreal textWidthMax;
     bool isHovering = opt.state.testFlag(QStyle::State_MouseOver) || isDropTarget;
     if (separatorItem) {
-        textWidthMax = isHovering ? (baseValue - kExpandIconSize - 10) : baseValue;
+        textWidthMax = isHovering ? (baseValue - kSeparatorExpandIconSize - 10) : baseValue;
     } else {
         textWidthMax = isEjectable ? min : max;
     }
@@ -464,9 +516,20 @@ void SideBarItemDelegate::drawIcon(const QStyleOptionViewItem &option,
         dciIcon = qvariant_cast<DDciIcon>(icon);
     if (dciIcon.isNull()) {
         QIcon::State state = option.state & QStyle::State_Open ? QIcon::On : QIcon::Off;
-        option.icon.paint(painter, iconRect, option.decorationAlignment, iconMode, state);
+
+        // 使用 IconCacheManager 缓存图标
+        const QString iconName = option.icon.name();
+        if (!iconName.isEmpty()) {
+            const qreal ratio = painter->device()->devicePixelRatioF();
+            QPixmap px = IconCacheManager::getPixmap(iconName, iconSize, ratio, iconMode, state);
+            painter->drawPixmap(iconRect.topLeft(), px);
+        } else {
+            // 非主题图标（如自定义文件图标）回退到 QIcon::paint
+            option.icon.paint(painter, iconRect, option.decorationAlignment, iconMode, state);
+        }
     } else {
-        drawDciIcon(optForIcon, painter, dciIcon, iconRect, cg, keepHighlighted);
+        drawDciIcon(optForIcon, painter, dciIcon, iconRect, cg, keepHighlighted,
+                    index.data(SideBarItem::kItemIconNameRole).toString());
     }
 
     painter->restore();
@@ -488,19 +551,20 @@ void SideBarItemDelegate::drawIcon(const QStyleOptionViewItem &option,
         iconRect = QRect(ejectIconTopLeft, ejectIconBottomRight);
         DDciIcon dciIcon = DDciIcon::fromTheme("media-eject-symbolic");
         if (dciIcon.isNull()) {
-            QIcon ejectIcon = QIcon::fromTheme("media-eject-symbolic");
-            auto px { ejectIcon.pixmap(iconSize, pixmapMode, QIcon::On) };
+            const qreal ratio = painter->device()->devicePixelRatioF();
+            QPixmap px = IconCacheManager::getPixmap("media-eject-symbolic", ejectIconSize, ratio, pixmapMode, QIcon::On);
             QStyle *style { option.widget ? option.widget->style() : QApplication::style() };
             style->drawItemPixmap(painter, iconRect, Qt::AlignCenter, px);
         } else {
-            drawDciIcon(option, painter, dciIcon, iconRect, cg, keepHighlighted);
+            drawDciIcon(option, painter, dciIcon, iconRect, cg, keepHighlighted, QStringLiteral("media-eject-symbolic"));
         }
     }
 }
 
 void SideBarItemDelegate::drawDciIcon(const QStyleOptionViewItem &option, QPainter *painter,
                                       const DTK_GUI_NAMESPACE::DDciIcon &dciIcon, const QRect &iconRect,
-                                      const QPalette::ColorGroup &cg, bool keepHighlighted) const
+                                      const QPalette::ColorGroup &cg, bool keepHighlighted,
+                                      const QString &iconId) const
 {
     DDciIcon::Mode mode = DStyle::toDciIconMode(&option);
     auto appTheme = DGuiApplicationHelper::toColorType(option.palette);
@@ -511,8 +575,26 @@ void SideBarItemDelegate::drawDciIcon(const QStyleOptionViewItem &option, QPaint
         const QColor fg = painter->pen().color();
         palette.setForeground(fg);
     }
-    dciIcon.paint(painter, iconRect, painter->device() ? painter->device()->devicePixelRatioF() : qApp->devicePixelRatio(),
-                  theme, mode, Qt::AlignCenter, palette);
+
+    QString key = makeIconCacheKey(iconRect.size(), theme, mode, iconId, palette.foreground());
+    if (m_iconCache.contains(key)) {
+        painter->drawPixmap(iconRect, m_iconCache.value(key));
+        return;
+    }
+
+    const qreal dpr = painter->device() ? painter->device()->devicePixelRatioF() : qApp->devicePixelRatio();
+    QPixmap px(iconRect.size() * dpr);
+    px.setDevicePixelRatio(dpr);
+    px.fill(Qt::transparent);
+    {
+        QPainter p(&px);
+        p.setRenderHints(painter->renderHints());
+        dciIcon.paint(&p, QRect(QPoint(0, 0), iconRect.size()), dpr, theme, mode, Qt::AlignCenter, palette);
+    }
+    if (m_iconCache.size() > 50)
+        m_iconCache.clear();
+    m_iconCache.insert(key, px);
+    painter->drawPixmap(iconRect, px);
 }
 
 void SideBarItemDelegate::drawMouseHoverBackground(QPainter *painter, const DPalette &palette, const QRect &r, const QColor &widgetColor) const
@@ -531,9 +613,15 @@ void SideBarItemDelegate::drawMouseHoverBackground(QPainter *painter, const DPal
 void SideBarItemDelegate::drawMouseHoverExpandButton(QPainter *painter, const QRect &r, bool isExpanded) const
 {
     painter->save();
-    int iconSize = kExpandIconSize;
+    SideBarView *sidebarView = dynamic_cast<SideBarView *>(this->parent());
+    if (!sidebarView) {
+        painter->restore();
+        return;
+    }
+
+    int iconSize = kSeparatorExpandIconSize;
 #ifdef DTKWIDGET_CLASS_DSizeMode
-    iconSize = DSizeModeHelper::element(kCompactExpandIconSize, kExpandIconSize);
+    iconSize = DSizeModeHelper::element(kCompactSeparatorExpandIconSize, kSeparatorExpandIconSize);
 #endif
 
     int x = r.right() - 10 - iconSize;
@@ -543,19 +631,86 @@ void SideBarItemDelegate::drawMouseHoverExpandButton(QPainter *painter, const QR
 
     bool isDarkType = DGuiApplicationHelper::instance()->themeType() == DGuiApplicationHelper::DarkType;
     QColor c(isDarkType ? qRgb(255, 255, 255) : qRgb(0, 0, 0));
+    QColor normalColor = isDarkType ? QColor(255, 255, 255, 102) : QColor(0, 0, 0, 102);
+    QColor hoverColor = isDarkType ? QColor(255, 255, 255, 179) : QColor(0, 0, 0, 179);
 
     painter->setPen(Qt::NoPen);
     painter->setBrush(c);
-    SideBarView *sidebarView = dynamic_cast<SideBarView *>(this->parent());
     QRect bgRect = iconRect.marginsAdded(QMargins(3, 3, 3, 3));
-    if (bgRect.contains(sidebarView->mapFromGlobal(QCursor::pos()))) {
+    const QPoint hoverPos = sidebarView->mapFromGlobal(QCursor::pos());
+    const bool isHoveringExpand = bgRect.contains(hoverPos);
+    if (isHoveringExpand) {
         painter->setOpacity(0.1);
-        painter->drawRoundedRect(bgRect, kRadius, kRadius);
+        painter->drawEllipse(QRectF(bgRect).adjusted(0.5, 0.5, -0.5, -0.5));
     }
 
     painter->setOpacity(1);
-    painter->setPen(Qt::gray);
-    QIcon icon = QIcon::fromTheme(isExpanded ? "go-up" : "go-down");
+    QColor arrowColor = isHoveringExpand ? hoverColor : normalColor;
+    int arrowSize = kExpandIconSize;
+#ifdef DTKWIDGET_CLASS_DSizeMode
+    arrowSize = DSizeModeHelper::element(kCompactExpandIconSize, kExpandIconSize);
+#endif
+    QRect arrowRect(QPoint(0, 0), QSize(arrowSize, arrowSize));
+    arrowRect.moveCenter(iconRect.center());
+
+    QStyleOptionButton arrowOpt;
+    arrowOpt.initFrom(sidebarView);
+    arrowOpt.rect = QRect(QPoint(0, 0), arrowRect.size());
+    arrowOpt.state |= QStyle::State_Enabled;
+    arrowOpt.palette.setColor(QPalette::ButtonText, Qt::white);
+    arrowOpt.palette.setColor(QPalette::WindowText, Qt::white);
+    arrowOpt.palette.setColor(QPalette::Text, Qt::white);
+
+    if (QStyle *style = sidebarView->style()) {
+        const qreal dpr = painter->device() ? painter->device()->devicePixelRatioF() : qApp->devicePixelRatio();
+        QPixmap arrowPixmap(arrowRect.size() * dpr);
+        arrowPixmap.setDevicePixelRatio(dpr);
+        arrowPixmap.fill(Qt::transparent);
+
+        QPainter arrowPainter(&arrowPixmap);
+        style->drawPrimitive(isExpanded ? QStyle::PE_IndicatorArrowUp : QStyle::PE_IndicatorArrowDown,
+                             &arrowOpt, &arrowPainter, sidebarView);
+        arrowPainter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+        arrowPainter.fillRect(QRect(QPoint(0, 0), arrowRect.size()), arrowColor);
+        arrowPainter.end();
+
+        painter->drawPixmap(arrowRect.topLeft(), arrowPixmap);
+    }
+    painter->restore();
+}
+
+void SideBarItemDelegate::drawExpandIndicator(QPainter *painter, QRect &r, bool expandable, const QModelIndex &index, bool isHighlight) const
+{
+    DStandardItem *item = qobject_cast<const SideBarModel *>(index.model())->itemFromIndex(index);
+    SideBarItem *subItem = dynamic_cast<SideBarItem *>(item);
+
+    if (!expandable || !subItem || subItem->group() != DefaultGroup::kDevice)
+        return;
+
+    // Only draw the indicator when partition expansion is enabled.
+    SideBarView *view = dynamic_cast<SideBarView *>(this->parent());
+    if (!view || !view->isPartitionExpandable())
+        return;
+
+    // Apply indentation only for items that will actually draw an indicator.
+    auto layer = 0;
+    auto idx(index);
+    while (idx.parent().isValid()) {
+        idx = idx.parent();
+        layer++;
+    }
+    r.setX(r.x() + ExpandIndicatorGeometry::kIndentPerLayer * layer);
+
+    int iconSize = ExpandIndicatorGeometry::kIconSize;
+    int x = r.left() + ExpandIndicatorGeometry::kIconOffset;
+    int y = r.top() + (r.height() / 2) - (iconSize / 2);
+    QRect iconRect(QPoint(x, y), QSize(iconSize, iconSize));
+
+    painter->save();
+    painter->setOpacity(1);
+    painter->setPen(qApp->palette().color(isHighlight ? QPalette::HighlightedText : QPalette::Text));
+    bool expanded = view ? view->isExpanded(index) : false;
+    QIcon icon = QIcon::fromTheme(expanded ? "go-down" : "go-next");
     icon.paint(painter, iconRect, Qt::AlignmentFlag::AlignCenter);
     painter->restore();
 }

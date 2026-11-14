@@ -27,6 +27,7 @@
 
 #include <QTextEdit>
 #include <QAbstractItemView>
+#include <QPixmapCache>
 #include <QTimer>
 
 #include <climits>
@@ -129,7 +130,7 @@ bool FileViewHelper::isSelected(const QModelIndex &index) const
 
 bool FileViewHelper::isDropTarget(const QModelIndex &index) const
 {
-    return parent()->isDragTarget(index);
+    return parent()->isDropTarget(index);
 }
 
 void FileViewHelper::initStyleOption(QStyleOptionViewItem *option, const QModelIndex &index) const
@@ -485,9 +486,18 @@ void FileViewHelper::init()
     connect(keyboardSearchTimer, &QTimer::timeout, this, &FileViewHelper::clearSearchKey);
     fmDebug() << "Keyboard search timer initialized with 200ms interval";
 
-    connect(qApp, &DApplication::iconThemeChanged, parent(), static_cast<void (QWidget::*)()>(&QWidget::update));
+    auto *view = parent();
+    if (view) {
+        connect(qApp, &DApplication::iconThemeChanged, view, [view]() {
+            // IconCacheManager::clear() uses a 0ms timer to coalesce clear calls, which fires
+            // after the repaint has already read stale pixmaps. Clear the cache synchronously
+            // here so the pending paint event regenerates icons from the new theme.
+            QPixmapCache::clear();
+            view->update();
+        });
+        connect(view, &FileView::triggerEdit, this, &FileViewHelper::triggerEdit);
+    }
     connect(ClipBoard::instance(), &ClipBoard::clipboardDataChanged, this, &FileViewHelper::clipboardDataChanged);
-    connect(parent(), &FileView::triggerEdit, this, &FileViewHelper::triggerEdit);
     connect(WorkspaceHelper::instance(), &WorkspaceHelper::requestSelectFiles, this, &FileViewHelper::selectFiles);
     connect(WorkspaceHelper::instance(), &WorkspaceHelper::trashStateChanged, this, &FileViewHelper::handleTrashStateChanged);
 

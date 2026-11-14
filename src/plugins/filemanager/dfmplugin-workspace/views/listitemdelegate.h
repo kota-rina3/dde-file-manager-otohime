@@ -7,7 +7,7 @@
 
 #include "baseitemdelegate.h"
 
-#include <dfm-base/dfm_global_defines.h>
+#include <dfm-base/interfaces/fileinfo.h>
 
 #include <QStyledItemDelegate>
 
@@ -55,13 +55,19 @@ private:
     void paintItemColumn(QPainter *painter, const QStyleOptionViewItem &option,
                          const QModelIndex &index, const QRectF &iconRect) const;
     void paintFileName(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index,
-                       const int &role, const QRectF &rect, const int &textLineHeight, const QUrl &url) const;
+                       const int &role, const QRectF &rect, const int &textLineHeight, const FileInfoPointer &info) const;
     QString getCorrectDisplayName(QPainter *painter, const QModelIndex &index, const QStyleOptionViewItem &option,
-                                  const QUrl &url, const int &role, const int &textLineHeight, const QRectF &rect) const;
+                                  const FileInfoPointer &info, const int &role, const int &textLineHeight, const QRectF &rect) const;
 
     bool setEditorData(ListItemEditor *editor);
 
     int dataWidth(const QStyleOptionViewItem &option, const QModelIndex &index, int role) const;
+
+    // Whether `index` is the root's first row in non-grouped list/tree mode,
+    // i.e. the row that carries the 10px transparent top padding (the design
+    // gap above the file list). Centralised so paint/sizeHint/updateEditorGeometry
+    // share one copy of the guard instead of drifting.
+    bool isFirstRowWithTopPadding(const QModelIndex &index) const;
 
     // Group functionality implementation
     int getGroupHeaderHeight(const QStyleOptionViewItem &option) const override;

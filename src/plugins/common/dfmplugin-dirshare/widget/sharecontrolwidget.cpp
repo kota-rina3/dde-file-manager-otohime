@@ -158,6 +158,8 @@ void ShareControlWidget::setupUi(bool disableState)
 void ShareControlWidget::setupShareSwitcher()
 {
     shareSwitcher = new QCheckBox(this);
+    shareSwitcher->setObjectName("ShareSwitcher");
+    shareSwitcher->setAccessibleName("ShareSwitcher");
     shareSwitcher->setFixedWidth(ConstDef::kWidgetFixedWidth);
     QString text = tr("Share this folder");
     shareSwitcher->setToolTip(text);
@@ -173,6 +175,8 @@ void ShareControlWidget::setupShareSwitcher()
 void ShareControlWidget::setupShareNameEditor()
 {
     shareNameEditor = new DLineEdit(this);
+    shareNameEditor->setObjectName("ShareNameEditor");
+    shareNameEditor->setAccessibleName("ShareNameEditor");
 
     static constexpr char kShareNameRegx[] { R"(^(?![ -])[^%<>*?|/\\+=;:,"]*+ ?$)" };
     QValidator *validator = new QRegularExpressionValidator(QRegularExpression(kShareNameRegx), this);
@@ -184,6 +188,8 @@ void ShareControlWidget::setupShareNameEditor()
 void ShareControlWidget::setupSharePermissionSelector()
 {
     sharePermissionSelector = new QComboBox(this);
+    sharePermissionSelector->setObjectName("SharePermissionSelector");
+    sharePermissionSelector->setAccessibleName("SharePermissionSelector");
 
     QPalette peMenuBg;
     QColor color = palette().color(QPalette::ColorGroup::Active, QPalette::ColorRole::Window);
@@ -197,6 +203,8 @@ void ShareControlWidget::setupSharePermissionSelector()
 void ShareControlWidget::setupShareAnonymousSelector()
 {
     shareAnonymousSelector = new QComboBox(this);
+    shareAnonymousSelector->setObjectName("ShareAnonymousSelector");
+    shareAnonymousSelector->setAccessibleName("ShareAnonymousSelector");
 
     QPalette peMenuBg;
     QColor color = palette().color(QPalette::ColorGroup::Active, QPalette::ColorRole::Window);
@@ -216,6 +224,8 @@ QHBoxLayout *ShareControlWidget::setupNetworkPath()
     networkAddrLabel->setFixedWidth(ConstDef::kWidgetFixedWidth);
 
     copyNetAddr = new QPushButton(this);
+    copyNetAddr->setObjectName("CopyNetAddr");
+    copyNetAddr->setAccessibleName("CopyNetAddr");
     copyNetAddr->setFlat(true);
     copyNetAddr->setToolTip(tr("Copy"));
     auto setBtnIcon = [=] {
@@ -250,6 +260,8 @@ QHBoxLayout *ShareControlWidget::setupUserName()
     userNamelineLabel->setFixedWidth(ConstDef::kWidgetFixedWidth);
 
     copyUserNameBt = new QPushButton(this);
+    copyUserNameBt->setObjectName("CopyUserNameBt");
+    copyUserNameBt->setAccessibleName("CopyUserNameBt");
     copyUserNameBt->setFlat(true);
     copyUserNameBt->setToolTip(tr("Copy"));
     auto setBtnIcon = [=] {
@@ -286,6 +298,8 @@ QHBoxLayout *ShareControlWidget::setupSharePassword()
     sharePassword->setText(isSharePasswordSet ? "●●●●●" : tr("None"));
 
     setPasswordBt = new DCommandLinkButton(tr("Set password"));
+    setPasswordBt->setObjectName("SetPasswordBt");
+    setPasswordBt->setAccessibleName("SetPasswordBt");
     setPasswordBt->setText(isSharePasswordSet ? tr("Change password") : tr("Set password"));
     setPasswordBt->setContentsMargins(0, 0, 0, 0);
     setPasswordBt->setToolTip(setPasswordBt->text());
@@ -448,6 +462,15 @@ void ShareControlWidget::updateShare()
 {
     QString filePath = url.toLocalFile();
 
+    // Revert to the previous share name when the editor is emptied.
+    if (shareNameEditor->text().trimmed().isEmpty()) {
+        QString fallback = UserShareHelperInstance->shareNameByPath(filePath);
+        if (fallback.isEmpty() && info)
+            fallback = info->displayOf(DisPlayInfoType::kFileDisplayName);
+        if (!fallback.isEmpty())
+            shareNameEditor->setText(fallback);
+    }
+
     // Get share info before update
     auto oldShareInfo = UserShareHelperInstance->shareInfoByPath(filePath);
     bool wasAnonymous = oldShareInfo.value(ShareInfoKeys::kAnonymous).toBool();
@@ -588,13 +611,28 @@ void ShareControlWidget::onSambaPasswordSet(bool result)
 void ShareControlWidget::onShareNameChanged(const QString &name)
 {
     static const int kShareNameMaxLen { 150 };
-    QString newText(name.trimmed());
+    QLineEdit *lineEdit = shareNameEditor->lineEdit();
+    const int cursorPos = lineEdit->cursorPosition();
+
+    // Count leading whitespace that trimmed() will strip, so the cursor can be
+    // repositioned correctly after the text is rewritten.
+    int leadingSpaces = 0;
+    while (leadingSpaces < name.size() && name.at(leadingSpaces).isSpace())
+        ++leadingSpaces;
+
+    QString newText = name.trimmed().toLower();
     bool showAlert = false;
     while (newText.toLocal8Bit().length() > kShareNameMaxLen) {
         newText.chop(1);
         showAlert = true;
     }
+
     shareNameEditor->setText(newText);
+    // Keep the cursor right after the just-typed character instead of jumping to
+    // the end, regardless of whether the text was lowercased, trimmed or truncated.
+    const int newCursorPos = qMin(qMax(0, cursorPos - leadingSpaces), newText.size());
+    lineEdit->setCursorPosition(newCursorPos);
+
     QTimer::singleShot(0, shareNameEditor, [this, showAlert] {
         if (showAlert)
             shareNameEditor->showAlertMessage(tr("The shared name is too long and will be truncated."));

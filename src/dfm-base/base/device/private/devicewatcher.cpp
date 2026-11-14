@@ -9,6 +9,7 @@
 #include <dfm-base/base/device/deviceutils.h>
 #include <dfm-base/base/device/deviceproxymanager.h>
 #include <dfm-base/base/configs/dconfig/dconfigmanager.h>
+#include <dfm-base/base/configs/dconfig/global_dconf_defines.h>
 #include <dfm-base/dbusservice/global_server_defines.h>
 #include <dfm-base/utils/finallyutil.h>
 
@@ -26,6 +27,11 @@
 using namespace dfmbase;
 DFM_MOUNT_USE_NS
 using namespace GlobalServerDefines;
+using namespace GlobalDConfDefines::ConfigPath;
+
+namespace {
+inline constexpr char kKeyDeviceUsagePollingInterval[] { "deviceUsagePollingInterval" };
+}
 
 DeviceWatcher::DeviceWatcher(QObject *parent)
     : QObject(parent), d(new DeviceWatcherPrivate(this))
@@ -44,7 +50,7 @@ void DeviceWatcher::startPollingUsage()
         return;
 
     qCInfo(logDFMBase) << "Starting device usage polling";
-    d->pollingTimer.start(d->kPollingInterval);   // 然后启动定时器
+    d->pollingTimer.start(d->pollingInterval);   // 然后启动定时器
 }
 
 void DeviceWatcher::stopPollingUsage()
@@ -74,13 +80,21 @@ void DeviceWatcher::refreshUsage()
 void DeviceWatcherPrivate::queryUsageAsync()
 {
     qCInfo(logDFMBase) << "Query device usage";
-    QThreadPool::globalInstance()->start([this] {
-        auto blocks = allBlockInfos;
-        auto protocols = allProtocolInfos;
+
+    // Snapshot the device infos on the caller (watcher) thread and never touch
+    // `this` inside the pooled task: the DeviceWatcher may already be destroyed
+    // when the pooled task starts to run (daemon shutdown, unit tests ...), and
+    // reading the member hashes through a dangling `this` caused SIGSEGV.
+    // All mutations of the two hashes below happen on this same thread (slots
+    // are queued connections), so the snapshot itself is race free.
+    const QHash<QString, QVariantMap> blocks = allBlockInfos;
+    const QHash<QString, QVariantMap> protocols = allProtocolInfos;
+
+    QThreadPool::globalInstance()->start([blocks, protocols] {
         std::for_each(blocks.cbegin(), blocks.cend(),
-                      [this](const QVariantMap &item) { queryUsageOfItem(item, DeviceType::kBlockDevice); });
+                      [](const QVariantMap &item) { queryUsageOfItem(item, DeviceType::kBlockDevice); });
         std::for_each(protocols.cbegin(), protocols.cend(),
-                      [this](const QVariantMap &item) { queryUsageOfItem(item, DeviceType::kProtocolDevice); });
+                      [](const QVariantMap &item) { queryUsageOfItem(item, DeviceType::kProtocolDevice); });
     });
 }
 
@@ -104,7 +118,7 @@ void DeviceWatcherPrivate::updateStorage(const QString &id, quint64 total, quint
         update(allProtocolInfos);
 }
 
-void DeviceWatcherPrivate::queryUsageOfItem(const QVariantMap &itemData, dfmmount::DeviceType type)
+void DeviceWatcherPrivate::queryUsageOfItem(const QVariantMap &itemData, DFMMOUNT::DeviceType type)
 {
     const QString &mpt = itemData.value(DeviceProperty::kMountPoint).toString();
     if (mpt.isEmpty())
@@ -333,13 +347,12 @@ void DeviceWatcher::onBlkDevRemoved(const QString &id)
 
 void DeviceWatcher::onBlkDevMounted(const QString &id, const QString &mpt)
 {
-    const QVariantMap &info = d->allBlockInfos.value(id);
+    QVariantMap info = d->allBlockInfos.value(id);
     // query info async avoid blocking main thread when disks' IO load is too high.
-#if (QT_VERSION >= QT_VERSION_CHECK(6, 0, 0))
-    QtConcurrent::run(&DeviceWatcherPrivate::queryUsageOfItem, d.data(), info, DFMMOUNT::DeviceType::kBlockDevice);
-#else
-    QtConcurrent::run(d.data(), &DeviceWatcherPrivate::queryUsageOfItem, info, DFMMOUNT::DeviceType::kBlockDevice);
-#endif
+    // `queryUsageOfItem` is stateless (static): passing `d.data()` here kept a raw
+    // pointer to the watcher private alive in the pool and crashed when the
+    // watcher was destroyed before the task ran.
+    QtConcurrent::run(&DeviceWatcherPrivate::queryUsageOfItem, info, DFMMOUNT::DeviceType::kBlockDevice);
     emit DevMngIns->blockDevMounted(id, mpt);
 }
 
@@ -373,9 +386,7 @@ void DeviceWatcher::onBlkDevFsAdded(const QString &id)
     emit DevMngIns->blockDevPropertyChanged(id, DeviceProperty::kHasFileSystem, true);
 
     auto mpt = data.value(DeviceProperty::kMountPoint).toString();
-    if (!mpt.isEmpty())
-        emit DevMngIns->blockDevMounted(id, mpt);
-    else
+    if (mpt.isEmpty())
         DevMngIns->doAutoMount(id, DeviceType::kBlockDevice);
 }
 
@@ -532,5 +543,34 @@ DeviceWatcherPrivate::DeviceWatcherPrivate(DeviceWatcher *qq)
     : QObject(qq), q(qq)
 {
     connect(DevProxyMng, &DeviceProxyManager::devSizeChanged, this, &DeviceWatcherPrivate::updateStorage, Qt::QueuedConnection);
-    DConfigManager::instance()->addConfig("org.deepin.dde.file-manager.mount");
+    DConfigManager::instance()->addConfig(kMountDConfName);
+
+    // 读取 DConfig 配置的轮询间隔
+    int cfgInterval = DConfigManager::instance()->value(kMountDConfName, kKeyDeviceUsagePollingInterval, 10).toInt();
+    // 配置单位为秒，转换为毫秒，并确保不小于最小值
+    pollingInterval = qMax(cfgInterval * 1000, kMinPollingInterval);
+    qCInfo(logDFMBase) << "Device usage polling interval set to" << pollingInterval << "ms";
+
+    // 监听配置变化
+    connect(DConfigManager::instance(), &DConfigManager::valueChanged, this, [this](const QString &config, const QString &key) {
+        if (config == kMountDConfName && key == kKeyDeviceUsagePollingInterval) {
+            onPollingIntervalChanged();
+        }
+    });
+}
+
+void DeviceWatcherPrivate::onPollingIntervalChanged()
+{
+    int cfgInterval = DConfigManager::instance()->value(kMountDConfName, kKeyDeviceUsagePollingInterval, 10).toInt();
+    int newInterval = qMax(cfgInterval * 1000, kMinPollingInterval);
+
+    if (newInterval != pollingInterval) {
+        pollingInterval = newInterval;
+        qCInfo(logDFMBase) << "Device usage polling interval changed to" << pollingInterval << "ms";
+
+        // 如果定时器正在运行，则更新间隔
+        if (pollingTimer.isActive()) {
+            pollingTimer.setInterval(pollingInterval);
+        }
+    }
 }

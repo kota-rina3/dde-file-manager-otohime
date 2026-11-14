@@ -45,6 +45,7 @@ private:
     void initTrashWatcher();
     void initTrashState();
     bool checkAndStartWatcher();
+    void syncTrashIconToAM(bool empty);
 
 private:
     TrashCoreStartupProbe *startupProbe { nullptr };
@@ -52,6 +53,7 @@ private:
     TrashState trashState { TrashState::Unknown };
     QTimer timer;
     bool watcherInitialized { false };
+    bool cifsCheckInProgress { false };
 };
 
 }

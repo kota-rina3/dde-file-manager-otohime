@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "syncfileinfo.h"
+#include "localfileinfodefs.h"
 #include "private/syncfileinfo_p.h"
 
 #include <dfm-base/base/urlroute.h>
@@ -10,6 +11,7 @@
 #include <dfm-base/base/schemefactory.h>
 #include <dfm-base/utils/chinese2pinyin.h>
 #include <dfm-base/utils/sysinfoutils.h>
+#include <dfm-base/utils/iconutils.h>
 #include <dfm-base/file/local/localfileiconprovider.h>
 #include <dfm-base/mimetype/mimetypedisplaymanager.h>
 #include <dfm-base/base/application/application.h>
@@ -141,6 +143,7 @@ void SyncFileInfo::refresh()
     }
     {
         QWriteLocker iconLocker(&d->iconLock);
+        d->fileIconName.clear();
         d->fileIcon = QIcon();
     }
 }
@@ -564,6 +567,10 @@ void SyncFileInfo::updateAttributes(const QList<FileInfo::FileInfoAttributeID> &
         typeAll.append(FileInfoAttributeID::kFileMimeType);
 
         typeAll.append(FileInfoAttributeID::kStandardSize);
+
+        QWriteLocker locker(&extendOtherCacheLock);
+        extendOtherCache.remove(ExtInfoType::kFileCanTag);
+        extendOtherCache.remove(ExtInfoType::kFileEmblems);
     }
     // 更新缩略图
     if (typeAll.contains(FileInfoAttributeID::kThumbnailIcon)) {
@@ -575,6 +582,7 @@ void SyncFileInfo::updateAttributes(const QList<FileInfo::FileInfoAttributeID> &
     if (typeAll.contains(FileInfoAttributeID::kStandardIcon)) {
         QWriteLocker wlk(&d->iconLock);
         d->fileIcon = QIcon();
+        d->fileIconName.clear();
     }
 
     // 更新mediaInfo
@@ -637,7 +645,7 @@ void SyncFileInfoPrivate::init(const QUrl &url, QSharedPointer<DFMIO::DFileInfo>
         return;
     }
 
-    dfmFileInfo.reset(new DFileInfo(cvtResultUrl));
+    dfmFileInfo.reset(new DFileInfo(cvtResultUrl, kFileAttributes));
 
     if (!dfmFileInfo) {
         qCWarning(logDFMBase, "Failed, dfm-io use factory create fileinfo");
@@ -806,20 +814,38 @@ QString SyncFileInfoPrivate::completeSuffix() const
 QString SyncFileInfoPrivate::iconName() const
 {
     assert(QThread::currentThread() == qApp->thread());
+
+    // 读锁快速路径：命中缓存直接返回，避免在计算期间长时间持写锁阻塞
+    // 并发的 fileIcon() 读取（#15）
+    {
+        QReadLocker rlk(&iconLock);
+        if (!fileIconName.isEmpty())
+            return fileIconName;
+    }
+
+    if (this->attribute(DFileInfo::AttributeID::kStandardIsDir).toBool()) {
+        QWriteLocker wlk(&iconLock);
+        if (!fileIconName.isEmpty())   // double-check
+            return fileIconName;
+        fileIconName = "inode-directory";
+        return fileIconName;
+    }
+
     QString iconNameValue;
     if (SystemPathUtil::instance()->isSystemPath(filePath()))
         iconNameValue = SystemPathUtil::instance()->systemPathIconNameByPath(filePath());
 
-    if (iconNameValue.isEmpty()) {
-        const QStringList &list = this->attribute(DFileInfo::AttributeID::kStandardIcon).toStringList();
-        const auto &iter = std::find_if(list.begin(), list.end(), [](const QString &name) { return QIcon::hasThemeIcon(name); });
-        if (iter != list.end())
-            iconNameValue = *iter;
-    }
+    auto mimetype = q->fileMimeType();
+    if (iconNameValue.isEmpty())
+        iconNameValue = mimetype.iconName();
 
-    if (!ProtocolUtils::isRemoteFile(q->fileUrl()) && iconNameValue.isEmpty())
-        iconNameValue = q->fileMimeType().iconName();
+    iconNameValue = IconUtils::normalizeIconName(iconNameValue);
 
+    // 仅在写入缓存时持写锁
+    QWriteLocker wlk(&iconLock);
+    if (!fileIconName.isEmpty())   // double-check：其它路径可能已填充
+        return fileIconName;
+    fileIconName = iconNameValue;
     return iconNameValue;
 }
 

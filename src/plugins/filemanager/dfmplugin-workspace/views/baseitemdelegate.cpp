@@ -12,12 +12,11 @@
 #include "models/fileviewmodel.h"
 
 #include <dfm-base/dfm_base_global.h>
-#include <dfm-base/utils/iconutils.h>
+#include <dfm-base/utils/iconpainterutils.h>
 
 #include <DPalette>
 #include <DPaletteHelper>
 #include <DGuiApplicationHelper>
-#include <DStyleOption>
 
 #include <QTextLayout>
 #include <QPainter>
@@ -37,6 +36,7 @@ inline constexpr int kTruncateButtonVerticalMargin { 3 };
 inline constexpr int kTruncateButtonHorizontalPadding { 12 };
 inline constexpr int kTruncateButtonTextSpacing { 6 };
 inline constexpr int kTruncateButtonWidthSlack { 10 };
+
 }   // namespace
 
 BaseItemDelegate::BaseItemDelegate(FileViewHelper *parent)
@@ -80,21 +80,20 @@ void BaseItemDelegate::paintEmblems(QPainter *painter, const QRectF &iconRect, c
         WorkspaceEventCaller::sendPaintEmblems(painter, iconRect, info);
 }
 
-bool BaseItemDelegate::isThumnailIconIndex(const QModelIndex &index) const
+bool BaseItemDelegate::isThumbnailIconIndex(const QModelIndex &index) const
 {
     if (!index.isValid() || !parent())
         return false;
 
-    FileInfoPointer info { parent()->fileInfo(index) };
-    if (info) {
-        if (IconUtils::shouldSkipThumbnailFrame(info->nameOf(NameInfoType::kMimeTypeName)))
-            return false;
+    return IconPainterUtils::isThumbnailIcon(parent()->fileInfo(index));
+}
 
-        const auto &attribute { info->extendAttributes(ExtInfoType::kFileThumbnail) };
-        if (attribute.isValid() && !attribute.value<QIcon>().isNull())
-            return true;
-    }
-    return false;
+bool BaseItemDelegate::skipThumbnailFrame(const QModelIndex &index) const
+{
+    if (!index.isValid() || !parent())
+        return false;
+
+    return IconPainterUtils::shouldSkipThumbnailFrame(parent()->fileInfo(index));
 }
 
 BaseItemDelegate::~BaseItemDelegate()
@@ -239,19 +238,28 @@ void BaseItemDelegate::paintDragIcon(QPainter *painter, const QStyleOptionViewIt
     QRectF iconRect = opt.rect;
     iconRect.setSize(size);
 
+    const auto iconName = index.data(dfmbase::Global::ItemRoles::kItemFileIconNameRole).toString();
+    const QIcon &fileIcon = index.data(dfmbase::Global::ItemRoles::kItemFileIconRole).value<QIcon>();
     painter->setRenderHint(QPainter::Antialiasing, true);
     painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
-    auto drawFileIcon = ItemDelegateHelper::paintIcon(painter, opt.icon,
+    const bool isThumbnail = isThumbnailIconIndex(index);
+    auto drawFileIcon = ItemDelegateHelper::paintIcon(painter,
+                                                      isThumbnail ? opt.icon : fileIcon,
                                                       { iconRect, Qt::AlignCenter,
                                                         QIcon::Normal, QIcon::Off,
-                                                        ViewMode::kIconMode, isThumnailIconIndex(index) });
+                                                        isThumbnail,
+                                                        iconName,
+                                                        ViewMode::kIconMode,
+                                                        skipThumbnailFrame(index) });
     // If the thumbnail drawing is empty, then redraw the file fileicon
     if (!drawFileIcon) {
         const QIcon &fileIcon = index.data(dfmbase::Global::ItemRoles::kItemFileIconRole).value<QIcon>();
         ItemDelegateHelper::paintIcon(painter, fileIcon,
                                       { iconRect, Qt::AlignCenter,
                                         QIcon::Normal, QIcon::Off,
-                                        ViewMode::kIconMode, false });
+                                        false,
+                                        iconName,
+                                        ViewMode::kIconMode });
     }
 }
 
@@ -276,7 +284,6 @@ void BaseItemDelegate::setPaintProxy(AbstractItemPaintProxy *proxy)
         delete d->paintProxy;
         d->paintProxy = nullptr;
     }
-
     d->paintProxy = proxy;
 }
 

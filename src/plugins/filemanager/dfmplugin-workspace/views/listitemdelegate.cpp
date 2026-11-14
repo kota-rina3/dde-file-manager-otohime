@@ -48,11 +48,29 @@ using namespace dfmplugin_workspace;
 ListItemDelegate::ListItemDelegate(FileViewHelper *parent)
     : BaseItemDelegate(*new ListItemDelegatePrivate(this), parent)
 {
-    setIconSizeByIconSizeLevel(1);
+    ListItemDelegate::setIconSizeByIconSizeLevel(1);
 }
 
 ListItemDelegate::~ListItemDelegate()
 {
+}
+
+bool ListItemDelegate::isFirstRowWithTopPadding(const QModelIndex &index) const
+{
+    // Centralised guard for the non-grouped list/tree first-row 10px transparent
+    // top padding. parent()->parent() is the FileView (delegate is parented to
+    // the FileViewHelper which is parented to the FileView); qobject_cast keeps
+    // the cast type-safe if that hierarchy ever changes.
+    // parent == rootIndex() excludes tree-mode expanded sub-items (whose row is
+    // also 0 under a different parent) and the rootIndex itself (used by
+    // FileView::itemSizeHint).
+    FileView *view = qobject_cast<FileView *>(parent()->parent());
+    return view
+        && !view->isGroupedView()
+        && (view->isListViewMode() || view->isTreeViewMode())
+        && !isGroupHeaderItem(index)
+        && index.row() == 0
+        && index.parent() == view->rootIndex();
 }
 
 void ListItemDelegate::paint(QPainter *painter,
@@ -67,7 +85,6 @@ void ListItemDelegate::paint(QPainter *painter,
 
     QStyleOptionViewItem opt = option;
 
-    auto info = parent()->fileInfo(index);
     initStyleOption(&opt, index);
     painter->setFont(opt.font);
 
@@ -88,6 +105,13 @@ void ListItemDelegate::paint(QPainter *painter,
     if (parent()->isTransparent(index)) {
         painter->setOpacity(0.3);
     }
+
+    // First row in non-grouped list/tree carries a 10px transparent top padding
+    // (the design gap above the file list). Shift the painted content down by
+    // that padding so the top 10px stays transparent, mirroring how non-first
+    // group headers skip their top kGroupHeaderInterval spacing.
+    if (isFirstRowWithTopPadding(index))
+        opt.rect.setTop(opt.rect.top() + kDefaultHeaderBottomMargin);
 
     paintItemBackground(painter, opt, index);
 
@@ -111,11 +135,17 @@ QSize ListItemDelegate::sizeHint(const QStyleOptionViewItem &option, const QMode
         return size;
     }
 
-    Q_UNUSED(index)
     Q_D(const ListItemDelegate);
 
-    // Todo(yanghao): isColumnCompact (fontMetrics.height() * 2 + 10)
-    return QSize(d->itemSizeHint.width(), qMax(option.fontMetrics.height(), d->itemSizeHint.height()));
+    // In non-grouped list/tree mode the first row carries a 10px transparent top
+    // padding (the design-level gap above the file list). It is part of the row's
+    // content height, so it scrolls with the content and the empty top area is
+    // treated as an empty area for rubber-band selection, just like the inter-
+    // group gap in the grouped view (which adds kGroupHeaderInterval instead).
+    int height = qMax(option.fontMetrics.height(), d->itemSizeHint.height());
+    if (isFirstRowWithTopPadding(index))
+        height += kDefaultHeaderBottomMargin;
+    return QSize(d->itemSizeHint.width(), height);
 }
 
 QWidget *ListItemDelegate::createEditor(QWidget *parent, const QStyleOptionViewItem &option, const QModelIndex &index) const
@@ -127,8 +157,12 @@ QWidget *ListItemDelegate::createEditor(QWidget *parent, const QStyleOptionViewI
     const quint64 sessionId = d->editingSessionId;
     d->editingIndex = index;
     d->editor = new ListItemEditor(parent);
-    auto size = sizeHint(option, index);
-    d->editor->setFixedHeight(size.height());
+    d->editor->setObjectName("Editor");
+    d->editor->setAccessibleName("Editor");
+    // Use the baseline item height (without the first-row top padding) for the
+    // editor so inline rename / Ctrl+M+M editing boxes are not 10px taller on row 0.
+    int editorHeight = qMax(option.fontMetrics.height(), d->itemSizeHint.height());
+    d->editor->setFixedHeight(editorHeight);
 
     connect(static_cast<ListItemEditor *>(d->editor), &ListItemEditor::inputFocusOut, this, &ListItemDelegate::editorFinished);
 
@@ -149,7 +183,15 @@ QWidget *ListItemDelegate::createEditor(QWidget *parent, const QStyleOptionViewI
 
 void ListItemDelegate::updateEditorGeometry(QWidget *editor, const QStyleOptionViewItem &option, const QModelIndex &index) const
 {
-    const QRect &optRect = option.rect + QMargins(-kListModeLeftMargin - kListModeLeftPadding, 0, -kListModeRightMargin - kListModeRightMargin, 0);
+    QRect optRect = option.rect + QMargins(-kListModeLeftMargin - kListModeLeftPadding, 0, -kListModeRightMargin - kListModeRightPadding, 0);
+
+    // First row in non-grouped list/tree carries a 10px transparent top padding.
+    // The editor is positioned within the row's content area (below the padding),
+    // otherwise it would be vertically centered over the full itemH+10 row and sit
+    // a few px higher than the actual text/icon content (and higher than other rows).
+    if (isFirstRowWithTopPadding(index))
+        optRect.setTop(optRect.top() + kDefaultHeaderBottomMargin);
+
     QRect iconRect = getRectOfItem(RectOfItemType::kItemIconRect, index);
 
     const QList<ItemRoles> &columnRoleList = parent()->parent()->model()->getColumnRoles();
@@ -244,7 +286,7 @@ bool ListItemDelegate::helpEvent(QHelpEvent *event, QAbstractItemView *view, con
             }
         }
 
-        if (tooltip.isEmpty() || index == view->rootIndex()) {
+        if (tooltip.isEmpty() || !view || index == view->rootIndex()) {
             ItemDelegateHelper::hideTooltipImmediately();
         } else {
             int tooltipSize = tooltip.size();
@@ -419,7 +461,7 @@ int ListItemDelegate::setIconSizeByIconSizeLevel(int level)
     }
 
     d->currentHeightLevel = level;
-    updateItemSizeHint();
+    ListItemDelegate::updateItemSizeHint();
     int iconHeight = d->itemSizeHint.height() * 0.75;
     parent()->parent()->setIconSize(QSize(iconHeight, iconHeight));   // Set iconSize to 0.75 of row height
 
@@ -501,14 +543,14 @@ void ListItemDelegate::paintItemBackground(QPainter *painter, const QStyleOption
  **/
 QRectF ListItemDelegate::paintItemIcon(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const
 {
+    D_DC(ListItemDelegate);
     if (!parent() || !parent()->parent() || !d->paintProxy)
         return QRect();
 
-    // draw icon
     QRectF iconRect = option.rect;
+
     d->paintProxy->drawIcon(painter, &iconRect, option, index);
     paintEmblems(painter, iconRect, index);
-
     return iconRect;
 }
 /*!
@@ -565,9 +607,8 @@ void ListItemDelegate::paintItemColumn(QPainter *painter, const QStyleOptionView
         Qt::TextElideMode elideMode = Qt::ElideRight;
 
         QRectF textRect = columnRect;
-        const QUrl &url = parent()->parent()->model()->data(index, kItemUrlRole).toUrl();
         if (rol == kItemNameRole || rol == kItemFileDisplayNameRole) {
-            paintFileName(painter, opt, index, rol, textRect, d->textLineHeight, url);
+            paintFileName(painter, opt, index, rol, textRect, d->textLineHeight, info);
         } else {
             textRect.setHeight(d->textLineHeight);
             textRect.moveTop(((columnRect.height() - textRect.height()) / 2) + columnRect.top());
@@ -576,18 +617,20 @@ void ListItemDelegate::paintItemColumn(QPainter *painter, const QStyleOptionView
                 painter->setPen(opt.palette.color(cGroup, QPalette::Text));
 
             if (data.canConvert<QString>()) {
-                QScopedPointer<ElideTextLayout> layout(ItemDelegateHelper::createTextLayout(index.data(rol).toString().remove('\n'),
-                                                                                            QTextOption::WrapAtWordBoundaryOrAnywhere,
-                                                                                            d->textLineHeight, index.data(Qt::TextAlignmentRole).toInt(),
-                                                                                            painter));
-                layout->layout(textRect, elideMode, painter);
+                // 直接用 QFontMetrics 省略 + drawText，跳过 ElideTextLayout
+                const QString rawText = index.data(rol).toString().remove('\n');
+                painter->drawText(textRect,
+                                  option.fontMetrics.elidedText(rawText, elideMode,
+                                                                qRound(textRect.width())),
+                                  QTextOption(static_cast<Qt::Alignment>(
+                                      index.data(Qt::TextAlignmentRole).toInt())));
             }
         }
     }
 }
 
 void ListItemDelegate::paintFileName(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index, const int &role, const QRectF &rect, const int &textLineHeight,
-                                     const QUrl &url) const
+                                     const FileInfoPointer &info) const
 {
     const QVariant &data = index.data(role);
     if (!data.canConvert<QString>())
@@ -613,19 +656,14 @@ void ListItemDelegate::paintFileName(QPainter *painter, const QStyleOptionViewIt
         textRect.setHeight(textLineHeight);
         textRect.moveTop(((topRect.height() - textRect.height()) / 2) + topRect.top());
 
-        QString fileName = getCorrectDisplayName(painter, index, option, url, role, textLineHeight, textRect);
-        // 绘制文件名(上半部分)
-        QScopedPointer<ElideTextLayout> nameLayout(ItemDelegateHelper::createTextLayout(
-                fileName,
-                QTextOption::WrapAtWordBoundaryOrAnywhere,
-                textLineHeight,
-                index.data(Qt::TextAlignmentRole).toInt(),
-                painter));
-
-        nameLayout->setHighlightEnabled(!isSelected);
-        nameLayout->setHighlightKeywords(effectiveHighlightKeywords(index));
-        nameLayout->setHighlightColor(QColor(ThemeColor::kHighlightPressColor));
-        nameLayout->layout(textRect, Qt::ElideRight, painter);
+        QString fileName = getCorrectDisplayName(painter, index, option, info, role, textLineHeight, textRect);
+        // 绘制文件名(上半部分) — 使用 reusable layout 避免重复 new/delete
+        d->setupElideLayout(d->reusableElideLayout.get(), fileName,
+                            QTextOption::WrapAtWordBoundaryOrAnywhere, textLineHeight,
+                            index.data(Qt::TextAlignmentRole).toInt(), painter,
+                            !isSelected, effectiveHighlightKeywords(index),
+                            QColor(ThemeColor::kHighlightPressColor));
+        d->reusableElideLayout->layout(textRect, Qt::ElideRight, painter);
 
         // 绘制文件内容预览(下半部分)
         painter->save();
@@ -641,44 +679,41 @@ void ListItemDelegate::paintFileName(QPainter *painter, const QStyleOptionViewIt
         painter->setFont(previewFont);
         painter->setPen(option.palette.color(isSelected ? QPalette::BrightText : QPalette::PlaceholderText));
 
-        QScopedPointer<ElideTextLayout> contentLayout(ItemDelegateHelper::createTextLayout(
-                previewContent,
-                QTextOption::WrapAtWordBoundaryOrAnywhere,
-                contentHeight,
-                index.data(Qt::TextAlignmentRole).toInt(),
-                painter));
-
-        contentLayout->setHighlightEnabled(!isSelected);
-        contentLayout->setHighlightKeywords(effectiveHighlightKeywords(index));
-        contentLayout->setHighlightColor(QColor(ThemeColor::kHighlightPressColor));
-        contentLayout->layout(contentRect, Qt::ElideRight, painter);
+        // 复用同一个 layout，setText 会重置 QTextDocument 内部状态
+        d->setupElideLayout(d->reusableElideLayout.get(), previewContent,
+                            QTextOption::WrapAtWordBoundaryOrAnywhere, contentHeight,
+                            index.data(Qt::TextAlignmentRole).toInt(), painter,
+                            !isSelected, effectiveHighlightKeywords(index),
+                            QColor(ThemeColor::kHighlightPressColor));
+        d->reusableElideLayout->layout(contentRect, Qt::ElideRight, painter);
         painter->restore();
     } else {
         textRect.setHeight(d->textLineHeight);
         textRect.moveTop(((rect.height() - textRect.height()) / 2) + rect.top());
-        QString fileName = getCorrectDisplayName(painter, index, option, url, role, textLineHeight, textRect);
-        // 原有的单行文件名绘制逻辑
-        QScopedPointer<ElideTextLayout> layout(ItemDelegateHelper::createTextLayout(
-                fileName,
-                QTextOption::WrapAtWordBoundaryOrAnywhere,
-                textLineHeight,
-                index.data(Qt::TextAlignmentRole).toInt(),
-                painter));
-
-        layout->setHighlightEnabled(!isSelected);
-        layout->setHighlightKeywords(effectiveHighlightKeywords(index));
-        layout->setHighlightColor(QColor(ThemeColor::kHighlightPressColor));
-        layout->layout(textRect, Qt::ElideRight, painter);
+        QString fileName = getCorrectDisplayName(painter, index, option, info, role, textLineHeight, textRect);
+        // 原有的单行文件名绘制逻辑 — 复用 reusable layout
+        d->setupElideLayout(d->reusableElideLayout.get(), fileName,
+                            QTextOption::WrapAtWordBoundaryOrAnywhere, textLineHeight,
+                            index.data(Qt::TextAlignmentRole).toInt(), painter,
+                            !isSelected, effectiveHighlightKeywords(index),
+                            QColor(ThemeColor::kHighlightPressColor));
+        d->reusableElideLayout->layout(textRect, Qt::ElideRight, painter);
     }
 }
 
 QString ListItemDelegate::getCorrectDisplayName(QPainter *painter, const QModelIndex &index, const QStyleOptionViewItem &option,
-                                                const QUrl &url, const int &role, const int &textLineHeight, const QRectF &rect) const
+                                                const FileInfoPointer &info, const int &role, const int &textLineHeight, const QRectF &rect) const
 {
+    Q_UNUSED(painter);
+    Q_UNUSED(option);
+    Q_UNUSED(textLineHeight);
+    Q_UNUSED(rect);
+
     QString displayName { "" };
 
     // 获取完整的显示名称，不进行省略处理
     // 省略处理将由 ElideTextLayout::layout 统一完成，以确保高亮功能正常工作
+    const QUrl &url = info ? info->urlOf(UrlInfoType::kUrl) : index.data(kItemUrlRole).toUrl();
     if (Q_LIKELY(!FileUtils::isDesktopFileSuffix(url))) {
         do {
             if (role != kItemNameRole && role != kItemFileDisplayNameRole)

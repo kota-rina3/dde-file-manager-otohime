@@ -25,6 +25,7 @@
 #include <dfm-base/utils/highlightprovider.h>
 #include <dfm-base/widgets/filemanagerwindowsmanager.h>
 #include <dfm-base/base/configs/dconfig/dconfigmanager.h>
+#include <dfm-base/utils/collation/collationstrategyprovider.h>
 #include <dfm-base/utils/protocolutils.h>
 
 #include <dfm-framework/event/event.h>
@@ -58,6 +59,8 @@ FileViewModel::FileViewModel(QAbstractItemView *parent)
     connect(Application::instance(), &Application::genericAttributeChanged, this, &FileViewModel::onGenericAttributeChanged);
     connect(Application::instance(), &Application::showedHiddenFilesChanged, this, &FileViewModel::onHiddenSettingChanged);
     connect(DConfigManager::instance(), &DConfigManager::valueChanged, this, &FileViewModel::onDConfigChanged);
+    connect(dfmbase::CollationStrategyProvider::instance(), &dfmbase::CollationStrategyProvider::strategyChanged,
+            this, &FileViewModel::onSortStrategyChanged, Qt::QueuedConnection);
     connect(&waitTimer, &QTimer::timeout, this, &FileViewModel::onSetCursorWait);
     waitTimer.setInterval(50);
 
@@ -843,6 +846,13 @@ QString FileViewModel::roleDisplayString(int role) const
 
 void FileViewModel::updateFile(const QUrl &url)
 {
+    auto index = getIndexByUrl(url);
+    if (index.isValid()) {
+        auto info = fileInfo(index);
+        if (info)
+            info->setExtendedAttributes(ExtInfoType::kFileEmblems, QVariant());
+    }
+
     Q_EMIT requestUpdateFile(url);
 }
 
@@ -943,6 +953,28 @@ void FileViewModel::setTreeView(const bool isTree)
 QStringList FileViewModel::getKeyWords()
 {
     return highlightKeywordsCache;
+}
+
+QList<QUrl> FileViewModel::getUrlsByRowIndex(int rowFirst, int rowEnd)
+{
+    QList<QUrl> urls;
+    for (int row = rowFirst; row <= rowEnd; ++row) {
+        if (filterSortWorker) {
+            auto data = filterSortWorker->childData(row);
+            if (data) {
+                auto url = data->data(Global::ItemRoles::kItemUrlRole).toUrl();
+                if (url.isValid())
+                    urls.append(url);
+            }
+            continue;
+        }
+
+        auto curIndex = index(row, 0);
+        if (!curIndex.isValid())
+            continue;
+        urls.append(curIndex.data(Global::ItemRoles::kItemUrlRole).toUrl());
+    }
+    return urls;
 }
 
 int FileViewModel::getFileOnlyCount() const
@@ -1231,6 +1263,14 @@ void FileViewModel::onDConfigChanged(const QString &config, const QString &key)
 
     if (DConfigInfo::kMtpThumbnailKey == key && ProtocolUtils::isMTPFile(rootUrl()))
         Q_EMIT requestClearThumbnail();
+}
+
+void FileViewModel::onSortStrategyChanged()
+{
+    // 排序策略变更（dconfig 开关切换）后，按当前列与顺序重新排序。
+    // sort() 内部会检查 model 是否 busy，busy 时跳过——下次导航/手动排序自然生效。
+    const int column = getColumnByRole(sortRole());
+    sort(column, sortOrder());
 }
 
 void FileViewModel::onSetCursorWait()

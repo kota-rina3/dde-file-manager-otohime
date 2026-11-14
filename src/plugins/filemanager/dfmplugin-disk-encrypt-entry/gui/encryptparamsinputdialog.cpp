@@ -4,10 +4,8 @@
 
 #include "encryptparamsinputdialog.h"
 #include "utils/encryptutils.h"
-#include "events/eventshandler.h"
 
 #include <dfm-base/utils/finallyutil.h>
-#include <dfm-mount/dmount.h>
 
 #include <QVBoxLayout>
 #include <QLabel>
@@ -114,6 +112,8 @@ QWidget *EncryptParamsInputDialog::createPasswordPage()
     wid->setLayout(lay);
 
     encType = new DComboBox(this);
+    encType->setObjectName("EncType");
+    encType->setAccessibleName("EncType");
     encType->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
     lay->addRow(tr("Unlock type"), encType);
 
@@ -128,17 +128,21 @@ QWidget *EncryptParamsInputDialog::createPasswordPage()
 
     keyHint1 = new QLabel(this);
     encKeyEdit1 = new DPasswordEdit(this);
+    encKeyEdit1->setObjectName("EncKeyEdit1");
+    encKeyEdit1->setAccessibleName("EncKeyEdit1");
     keyHint1->setMinimumWidth(66);
     lay->addRow(keyHint1, encKeyEdit1);
 
     keyHint2 = new QLabel(this);
     encKeyEdit2 = new DPasswordEdit(this);
+    encKeyEdit2->setObjectName("EncKeyEdit2");
+    encKeyEdit2->setAccessibleName("EncKeyEdit2");
     lay->addRow(keyHint2, encKeyEdit2);
 
     encType->addItems({ tr("Unlocked by passphrase"),
                         tr("Use TPM+PIN to unlock on this computer (recommended)"),
                         tr("Automatic unlocking on this computer by TPM") });
-
+    fmDebug() << "[EncryptParamsInputDialog::createPasswordPage] Befor checkTPM()";
     if (tpm_utils::checkTPM() != 0 || tpm_utils::checkTPMLockoutStatus() != 0) {
         // encType->setItemData(kTPMAndPIN, QVariant(0), Qt::UserRole - 1);
         // encType->setItemData(kTPMOnly, QVariant(0), Qt::UserRole - 1);
@@ -174,6 +178,8 @@ QWidget *EncryptParamsInputDialog::createExportPage()
     hint->setAlignment(Qt::AlignCenter);
 
     keyExportInput = new DFileChooserEdit(this);
+    keyExportInput->setObjectName("KeyExportInput");
+    keyExportInput->setAccessibleName("KeyExportInput");
     keyExportInput->setFileMode(QFileDialog::Directory);
     if (keyExportInput->fileDialog() && dialog_utils::isWayland())
         keyExportInput->fileDialog()->setWindowFlag(Qt::WindowStaysOnTopHint);
@@ -243,65 +249,6 @@ bool EncryptParamsInputDialog::validatePassword()
         fmWarning() << "Password confirmation does not match";
         encKeyEdit2->showAlertMessage(tr("%1 inconsistency").arg(keyType));
         return false;
-    }
-
-    return true;
-}
-
-bool EncryptParamsInputDialog::validateExportPath(const QString &path, QString *msg)
-{
-    auto setMsg = [&](const QString &info) { if (msg) *msg = info; };
-    if (path.isEmpty()) {
-        setMsg(tr("Recovery key export path cannot be empty!"));
-        return false;
-    }
-
-    if (!QDir(path).exists()) {
-        fmWarning() << "Export path does not exist:" << path;
-        setMsg(tr("Recovery key export path is not exists!"));
-        return false;
-    }
-
-    QStorageInfo storage(path);
-    QString dev = storage.device();
-    QStringList associatedDevs { dev };
-    if (dev.startsWith("/dev/mapper/")) {
-        QFileInfo f(dev);
-        if (f.isSymbolicLink()) {
-            auto linkDev = f.symLinkTarget(); // /dev/dm-*
-            if (!linkDev.isEmpty()) {
-                associatedDevs.append(EventsHandler::instance()->holderDevice(linkDev));
-            }
-        }
-    }
-
-    QString targetDevice = args.value(encrypt_param_keys::kKeyDevice).toString();
-    if (associatedDevs.contains(targetDevice)) {
-        fmWarning() << "Export path is on the same device being encrypted:" << targetDevice;
-        setMsg(tr("Please export to an external device such as a non-encrypted partition or USB flash drive."));
-        return false;
-    }
-
-    if (storage.isReadOnly()) {
-        fmWarning() << "Export path is read-only:" << path;
-        setMsg(tr("This partition is read-only, please export to a writable partition"));
-        return false;
-    }
-
-    // Check if the export path itself is encrypted
-    using namespace dfmmount;
-    auto monitor = DDeviceManager::instance()->getRegisteredMonitor(DeviceType::kBlockDevice).objectCast<DBlockMonitor>();
-    Q_ASSERT(monitor);
-    auto devObjPaths = monitor->resolveDeviceNode(dev, {});
-    if (!devObjPaths.isEmpty()) {
-        auto objPath = devObjPaths.constFirst();
-        auto devPtr = monitor->createDeviceById(objPath);
-        if (devPtr && devPtr->getProperty(Property::kBlockCryptoBackingDevice).toString() != "/") {
-            fmWarning() << "Export path is on an encrypted partition:" << path;
-            setMsg(tr("The partition is encrypted, please export to a non-encrypted "
-                      "partition or external device such as a USB flash drive."));
-            return false;
-        }
     }
 
     return true;
@@ -412,9 +359,10 @@ void EncryptParamsInputDialog::onExpPathChanged(const QString &path, bool silent
     }
 
     QString msg;
-    btnNext->setEnabled(validateExportPath(path, &msg));
+    btnNext->setEnabled(recovery_key_utils::validateExportPath(
+            path, args.value(encrypt_param_keys::kKeyDevice).toString(), &msg));
     if (!msg.isEmpty() && !silent)
-        keyExportInput->showAlertMessage(msg);
+        keyExportInput->showAlertMessage(msg, 5000);
 }
 
 bool EncryptParamsInputDialog::encryptByTpm(const QString &deviceName)

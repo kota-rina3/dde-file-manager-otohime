@@ -42,16 +42,17 @@ class FileView final : public DListView, public DFMBASE_NAMESPACE::AbstractBaseV
     friend class ViewGeometryHelper;
     friend class StickyGroupHeaderHelper;
     friend class IconItemDelegate;
+    friend class ListItemDelegate;
 
-    QSharedPointer<FileViewPrivate> d;
+    QScopedPointer<FileViewPrivate> d;
 
-    using RangeIndex = QPair<int, int>;
+    using RangeIndex = std::pair<int, int>;
     using RangeIndexList = QList<RangeIndex>;
 
 public:
     enum class ClickedAction : uint8_t {
         kClicked = 0,
-        kDoubleClicked
+        kDoubleClicked,
     };
 
     explicit FileView(const QUrl &url, QWidget *parent = nullptr);
@@ -83,7 +84,7 @@ public:
     int horizontalOffset() const override;
     int verticalOffset() const override;
 
-    QList<DFMGLOBAL_NAMESPACE::ItemRoles> getColumnRoles() const;
+    const QList<DFMGLOBAL_NAMESPACE::ItemRoles> &getColumnRoles() const;
     int getColumnWidth(const int &column) const;
     int getHeaderViewWidth() const;
     bool isSelected(const QModelIndex &index) const;
@@ -94,7 +95,7 @@ public:
     void setEnabledSelectionModes(const QList<SelectionMode> &modes);
     void setSort(const DFMGLOBAL_NAMESPACE::ItemRoles role, const Qt::SortOrder order);
     void setGroup(const QString &strategyName, const Qt::SortOrder order = Qt::AscendingOrder);
-    GroupingState groupingState();
+    GroupingState groupingState() const;
 
     void setViewSelectState(bool isSelect);
 
@@ -116,20 +117,27 @@ public:
 
     QModelIndex currentPressIndex() const;
 
-    bool isDragTarget(const QModelIndex &index) const;
+    bool isDropTarget(const QModelIndex &index) const;
 
     QRectF itemRect(const QUrl &url, const DFMGLOBAL_NAMESPACE::ItemRoles role) const;
+    /*!
+     * \brief The icon cell of the item at \a url as painted by the delegate
+     *
+     * Viewport coordinates. Replicates the paint geometry of the current view
+     * mode: grouped icon mode strips the virtual margins, list/tree views
+     * follow the paint proxies (first-row padding, vertical centering, tree
+     * indent).
+     */
+    QRect iconRect(const QUrl &url) const;
 
     bool isVerticalScrollBarSliderDragging() const;
     void updateViewportContentsMargins(const QSize &itemSize);
-    bool indexInRect(const QRect &actualRect, const QModelIndex &index);
+    bool indexInRect(const QRect &actualRect, const QModelIndex &index) const;
     QList<QUrl> selectedTreeViewUrlList() const;
     void selectedTreeViewUrlList(QList<QUrl> &selectedUrls, QList<QUrl> &treeSelectedUrls) const;
 
     QRect calcVisualRect(int widgetWidth, int index) const;
     void aboutToChangeWidth(int deltaWidth);
-
-    void initDefaultHeaderView();
 
     using DListView::edit;
     using DListView::updateGeometries;
@@ -270,9 +278,10 @@ private:
 
     bool isGroupHeader(const QModelIndex &index) const;
     bool isClickInGroupHeaderSpacing(const QPoint &pos, const QModelIndex &index) const;
+    bool isClickInTopPadding(const QPoint &pos, const QModelIndex &index) const;
     QModelIndex indexAtForSelection(const QPoint &pos) const;
 
-    QModelIndex findStickyGroupIndex(int headerHeight);
+    QModelIndex findStickyGroupIndex(int headerHeight) const;
     int computeStickyY(int headerHeight) const;
     int stickyHeaderHeight() const;
     void paintStickyHeaderOverlay(const QModelIndex &index, int y, int headerHeight);

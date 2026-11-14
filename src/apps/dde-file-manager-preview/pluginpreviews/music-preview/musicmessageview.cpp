@@ -52,28 +52,33 @@ void MusicMessageView::initUI()
     setFixedSize(600, 300);
 
     titleLabel = new QLabel(this);
+    titleLabel->setAccessibleName("TitleLabel");
     titleLabel->setObjectName("Title");
     DFontSizeManager::instance()->bind(titleLabel, DFontSizeManager::SizeType::T4, QFont::Weight::DemiBold);
 
     artistLabel = new QLabel(this);
+    artistLabel->setAccessibleName("ArtistLabel");
     artistLabel->setObjectName("Artist");
     artistLabel->setText(tr("Artist:"));
     QFont artistLabelFont = artistLabel->font();
     artistLabelFont.setPixelSize(12);
     artistLabel->setFont(artistLabelFont);
     artistValue = new QLabel(this);
+    artistValue->setAccessibleName("ArtistValue");
     artistValue->setObjectName("artistValue");
     QFont artistValueFont = artistValue->font();
     artistValueFont.setPixelSize(12);
     artistValue->setFont(artistValueFont);
 
     albumLabel = new QLabel(this);
+    albumLabel->setAccessibleName("AlbumLabel");
     albumLabel->setObjectName("Album");
     albumLabel->setText(tr("Album:"));
     QFont albumLabelFont = albumLabel->font();
     albumLabelFont.setPixelSize(12);
     albumLabel->setFont(albumLabelFont);
     albumValue = new QLabel(this);
+    albumValue->setAccessibleName("AlbumValue");
     albumValue->setObjectName("albumValue");
     QFont albumValueFont = albumValue->font();
     albumValueFont.setPixelSize(12);
@@ -220,10 +225,6 @@ QList<QByteArray> MusicMessageView::detectEncodings(const QByteArray &rawData)
 
     for (int32_t match = 0; match < matchCount; match += 1) {
         const char *name = ucsdet_getName(csm[match], &status);
-        const char *lang = ucsdet_getLanguage(csm[match], &status);
-        if (lang == nullptr || strlen(lang) == 0) {
-            lang = "**";
-        }
         charsets << name;
     }
 

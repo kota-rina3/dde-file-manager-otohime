@@ -40,8 +40,11 @@ void BurnOptDialog::setUDFSupported(bool supported, bool disableISOOpts)
     if (!model || model->rowCount() < 4)
         return;
 
-    if (!supported)
+    if (!supported) {
         model->setData(model->index(3, 0), 0, Qt::UserRole - 1);
+        if (BurnHelper::defaultBurnFs() == 3)
+            fsComb->setCurrentIndex(1);
+    }
     if (disableISOOpts) {
         model->setData(model->index(0, 0), 0, Qt::UserRole - 1);
         model->setData(model->index(1, 0), 0, Qt::UserRole - 1);
@@ -128,6 +131,8 @@ void BurnOptDialog::initializeUi()
     volnameLabel->setFont(f13);
 
     volnameEdit = new QLineEdit();
+    volnameEdit->setObjectName("VolnameEdit");
+    volnameEdit->setAccessibleName("VolnameEdit");
     QRegularExpression regx("[^\\\\/\':\\*\\?\"<>|%&.]+");   // 屏蔽特殊字符
     QValidator *validator = new QRegularExpressionValidator(regx, volnameEdit);
     volnameEdit->setValidator(validator);
@@ -142,6 +147,8 @@ void BurnOptDialog::initializeUi()
 
     // 高级设置内容
     advanceBtn = new DCommandLinkButton(BurnOptDialog::tr("Advanced settings"), this);
+    advanceBtn->setObjectName("AdvanceBtn");
+    advanceBtn->setAccessibleName("AdvanceBtn");
     QFont f12 = advanceBtn->font();
     f12.setPixelSize(12);
     f12.setWeight(QFont::Normal);
@@ -174,8 +181,10 @@ void BurnOptDialog::initializeUi()
     };
 
     fsComb = new QComboBox;
+    fsComb->setObjectName("FsComb");
+    fsComb->setAccessibleName("FsComb");
     fsComb->addItems(fsTypes);
-    fsComb->setCurrentIndex(1);   // 默认使用 i + j 的方式刻录
+    fsComb->setCurrentIndex(BurnHelper::defaultBurnFs());
     vLay->addWidget(fsComb);
     fsLabel->setFont(f13);
     fsComb->setFont(f14);
@@ -191,6 +200,8 @@ void BurnOptDialog::initializeUi()
     writespeedLabel = new QLabel(QObject::tr("Write speed:"));
     vLay->addWidget(writespeedLabel, 0, Qt::AlignTop);
     writespeedComb = new QComboBox();
+    writespeedComb->setObjectName("WritespeedComb");
+    writespeedComb->setAccessibleName("WritespeedComb");
     writespeedComb->addItem(QObject::tr("Maximum"));
     vLay->addWidget(writespeedComb, 0, Qt::AlignTop);
     speedMap[QObject::tr("Maximum")] = 0;
@@ -199,6 +210,8 @@ void BurnOptDialog::initializeUi()
 
     // 刻录选项-封盘设置
     finalizeDiscCheckbox = new QCheckBox(QObject::tr("Finalize disc after burning \n(no additional data can be appended)"));
+    finalizeDiscCheckbox->setObjectName("FinalizeDiscCheckbox");
+    finalizeDiscCheckbox->setAccessibleName("FinalizeDiscCheckbox");
     finalizeDiscCheckbox->setChecked(false);
     vLay->addWidget(finalizeDiscCheckbox, 0, Qt::AlignTop);
     QWidget *wpostburn = new QWidget();
@@ -209,14 +222,20 @@ void BurnOptDialog::initializeUi()
 
     // 刻录选项-校验数据
     checkdiscCheckbox = new QCheckBox(QObject::tr("Verify data"));
+    checkdiscCheckbox->setObjectName("CheckdiscCheckbox");
+    checkdiscCheckbox->setAccessibleName("CheckdiscCheckbox");
     checkdiscCheckbox->setFont(f12);
     wpostburn->layout()->addWidget(checkdiscCheckbox);
     // 刻录选项-校验文件
     checksumCheckbox = new QCheckBox(QObject::tr("Verify files (checksum)"));
+    checksumCheckbox->setObjectName("ChecksumCheckbox");
+    checksumCheckbox->setAccessibleName("ChecksumCheckbox");
     checksumCheckbox->setFont(f12);
     vLay->addWidget(checksumCheckbox, 0, Qt::AlignTop);
     // 刻录选项-弹出光盘（目前禁用）
     ejectCheckbox = new QCheckBox(QObject::tr("Eject"));
+    ejectCheckbox->setObjectName("EjectCheckbox");
+    ejectCheckbox->setAccessibleName("EjectCheckbox");
     ejectCheckbox->setFont(f12);
     ejectCheckbox->setChecked(true);
     wpostburn->layout()->addWidget(ejectCheckbox);

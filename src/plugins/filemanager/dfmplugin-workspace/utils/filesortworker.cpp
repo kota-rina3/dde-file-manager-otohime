@@ -11,6 +11,7 @@
 #include <dfm-base/utils/fileutils.h>
 #include <dfm-base/base/device/deviceproxymanager.h>
 #include <dfm-base/utils/fileinfohelper.h>
+#include <dfm-base/utils/infocache.h>
 #include <dfm-base/base/standardpaths.h>
 #include <dfm-base/utils/universalutils.h>
 #include <dfm-base/mimetype/mimetypedisplaymanager.h>
@@ -972,6 +973,11 @@ void FileSortWorker::handleRefresh()
     }
 
     {
+        QReadLocker lk(&childrenDataLocker);
+        emit dfmbase::InfoCacheController::instance().removeCacheFileInfo(childrenDataMap.keys());
+    }
+
+    {
         QWriteLocker lk(&childrenDataLocker);
         childrenDataMap.clear();
     }
@@ -984,11 +990,15 @@ void FileSortWorker::handleRefresh()
 
 void FileSortWorker::handleClearThumbnail()
 {
-    QReadLocker lk(&childrenDataLocker);
-    for (const auto &item : childrenDataMap.values()) {
-        if (Q_LIKELY(item))
-            item->clearThumbnail();
+    {
+        QReadLocker lk(&childrenDataLocker);
+        for (const auto &item : childrenDataMap.values()) {
+            if (Q_LIKELY(item))
+                item->clearThumbnail();
+        }
     }
+
+    InfoCacheController::instance().clearCachedExtendedAttribute(ExtInfoType::kFileThumbnail);
 
     Q_EMIT requestUpdateView();
 }
@@ -1936,21 +1946,7 @@ bool FileSortWorker::checkFilters(const SortInfoPointer &sortInfo, const bool by
 
 bool FileSortWorker::isDefaultHiddenFile(const QUrl &fileUrl)
 {
-    static DThreadList<QUrl> defaultHiddenUrls;
-    static std::once_flag flg;
-    std::call_once(flg, [&] {
-        using namespace GlobalServerDefines;
-        const auto &systemBlks = DevProxyMng->getAllBlockIds(DeviceQueryOption::kSystem | DeviceQueryOption::kMounted);
-        for (const auto &blk : systemBlks) {
-            auto blkInfo = DevProxyMng->queryBlockInfo(blk);
-            const QStringList &mountPoints = blkInfo.value(DeviceProperty::kMountPoints).toStringList();
-            for (const auto &mpt : mountPoints) {
-                defaultHiddenUrls.push_backByLock(QUrl::fromLocalFile(mpt + (mpt == "/" ? "root" : "/root")));
-                defaultHiddenUrls.push_backByLock(QUrl::fromLocalFile(mpt + (mpt == "/" ? "lost+found" : "/lost+found")));
-            }
-        }
-    });
-    return defaultHiddenUrls.containsByLock(fileUrl);
+    return FileUtils::isDefaultHiddenFile(fileUrl);
 }
 
 QUrl FileSortWorker::makeParentUrl(const QUrl &url)

@@ -39,6 +39,8 @@
 #include <QGuiApplication>
 #include <QInputMethod>
 #include <QMetaObject>
+#include <QPainter>
+#include <QPainterPath>
 #include <QResizeEvent>
 #include <QTimer>
 
@@ -51,6 +53,12 @@ using namespace GlobalDConfDefines::BaseConfig;
 
 inline constexpr int kSpacing { 10 };
 inline constexpr char kIsCustomTab[] { "isCustomTab" };
+inline constexpr qreal kTopBarOverlayAlphaLight { 0.04 };
+inline constexpr qreal kTopBarOverlayAlphaDark { 0.10 };
+inline constexpr int kSelectedTabTopInset { 5 };
+inline constexpr int kLeadingSelectedInsetWithoutPaging { 10 };
+inline constexpr int kSelectedTabTopCornerRadius { 8 };
+inline constexpr int kSelectedTabBottomOuterRadius { 13 };
 
 TitleBarWidget::TitleBarWidget(QFrame *parent)
     : AbstractFrame(parent)
@@ -196,7 +204,8 @@ void TitleBarWidget::handleSplitterAnimation(const QVariant &position)
 
 void TitleBarWidget::handleHotkeyCtrlF()
 {
-    searchEditWidget->activateEdit();
+    if (searchEditWidget->isVisible())
+        searchEditWidget->activateEdit();
 }
 
 void TitleBarWidget::handleHotkeyCtrlL()
@@ -295,6 +304,10 @@ void TitleBarWidget::initializeUi()
 
     // titlebar
     topBar = new DTitlebar;
+    topBar->setBackgroundTransparent(true);
+    topBar->setSeparatorVisible(false);
+    topBar->setAutoFillBackground(false);
+    topBar->setAttribute(Qt::WA_TranslucentBackground);
     topBar->setFixedHeight(DSizeModeHelper::element(24, 40));
     auto topBarLayout = topBar->layout();
     if (topBarLayout) {
@@ -303,11 +316,14 @@ void TitleBarWidget::initializeUi()
     }
 
     QWidget *topCustomWidget = new QWidget(topBar);
+    topCustomWidget->setAutoFillBackground(false);
+    topCustomWidget->setAttribute(Qt::WA_TranslucentBackground);
     topBarCustomLayout = new QHBoxLayout;
     topBarCustomLayout->setContentsMargins(0, 0, 0, 0);
     topBarCustomLayout->setSpacing(0);
 
     placeholder = new QWidget(topCustomWidget);
+    placeholder->setAccessibleName("Placeholder");
     placeholder->setFixedHeight(40);
     placeholder->setFixedWidth(0);
     placeholder->setVisible(true);
@@ -321,6 +337,8 @@ void TitleBarWidget::initializeUi()
 
     // tabbar
     bottomBar = new TabBar;
+    bottomBar->setObjectName("BottomBar");
+    bottomBar->setAccessibleName("BottomBar");
     bottomBar->installEventFilter(this);
     topBarCustomLayout->addWidget(bottomBar, 1);
     topBarCustomLayout->addSpacing(10);
@@ -339,6 +357,8 @@ void TitleBarWidget::initializeUi()
     // search widget
     searchEditWidget = new SearchEditWidget(this);
     searchEditWidget->setFixedHeight(30);
+    if (!DConfigManager::instance()->value(kSearchDConfName, kConfigEnableSearch, true).toBool())
+        searchEditWidget->setVisible(false);
 
     // option button
     optionButtonBox = new OptionButtonBox(this);
@@ -380,6 +400,101 @@ void TitleBarWidget::initializeUi()
     updateUiForSizeMode();
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     showCrumbBar();
+}
+
+void TitleBarWidget::paintEvent(QPaintEvent *event)
+{
+    AbstractFrame::paintEvent(event);
+
+    if (!topBar)
+        return;
+
+    const bool isDarkTheme = DGuiApplicationHelper::instance()->themeType() == DGuiApplicationHelper::DarkType;
+    const int alpha = qRound(255 * (isDarkTheme ? kTopBarOverlayAlphaDark : kTopBarOverlayAlphaLight));
+
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(0, 0, 0, alpha));
+    painter.drawRect(topBar->geometry());
+
+    if (!bottomBar || bottomBar->count() <= 0)
+        return;
+
+    const int currentIndex = bottomBar->currentIndex();
+    if (currentIndex < 0 || currentIndex >= bottomBar->count())
+        return;
+
+    // The parent paints before the child TabBar, while QTabBar may still hold
+    // a stale pending layout (e.g. right after a tab was appended). Flush it
+    // so tabRect() reflects the up-to-date geometry (fixes 1->2 tab shift).
+    bottomBar->ensureLayoutUpdated();
+    // While a cross-window drag hovers over this window a drag-preview (ghost)
+    // tab exists in the strip: the highlight belongs to the incoming tab, so
+    // suppress the selected-tab highlight entirely until the ghost is removed.
+    if (bottomBar->hasDragPreviewTab())
+        return;
+    // While a tab is being dragged, DTK moves the drag snapshot independently
+    // of the static layout, so take the highlight rect from TabBar's live
+    // snapshot tracking instead of the now-detached tabRect().
+    QRect fullRect;
+    QRect visibleRect;
+    if (tabDragActive) {
+        fullRect = tabDragRect;
+        if (!fullRect.isValid())
+            return;
+        visibleRect = fullRect.intersected(bottomBar->tabViewportRect());
+    } else {
+        fullRect = bottomBar->tabRect(currentIndex);
+        if (!fullRect.isValid())
+            return;
+        visibleRect = bottomBar->visibleTabRect(currentIndex);
+    }
+    // An empty result means the selected tab is scrolled completely out of
+    // the viewport, so there is nothing visible left to highlight.
+    if (visibleRect.isEmpty())
+        return;
+
+    const QMarginsF visualMargins = bottomBar->tabVisualMargins(currentIndex);
+    const QPoint tabTopLeft = bottomBar->mapTo(this, fullRect.topLeft());
+    const QRectF selectedRect = QRectF(QRect(tabTopLeft, fullRect.size())).adjusted(visualMargins.left(), kSelectedTabTopInset, -visualMargins.right(), 0.0);
+    const qreal left = selectedRect.left();
+    const qreal top = selectedRect.top();
+    const qreal right = selectedRect.right();
+    const qreal joinY = topBar->geometry().bottom() + 1.0;
+    const qreal topRadius = kSelectedTabTopCornerRadius;
+    const qreal bottomRadius = kSelectedTabBottomOuterRadius;
+
+    QPainterPath selectedPath;
+    selectedPath.moveTo(left - bottomRadius, joinY);
+    selectedPath.quadTo(left, joinY, left, joinY - bottomRadius);
+    selectedPath.lineTo(left, top + topRadius);
+    selectedPath.quadTo(left, top, left + topRadius, top);
+    selectedPath.lineTo(right - topRadius, top);
+    selectedPath.quadTo(right, top, right, top + topRadius);
+    selectedPath.lineTo(right, joinY - bottomRadius);
+    selectedPath.quadTo(right, joinY, right + bottomRadius, joinY);
+    selectedPath.lineTo(right + bottomRadius, height());
+    selectedPath.lineTo(left - bottomRadius, height());
+    selectedPath.closeSubpath();
+
+    // When the selected tab is partially scrolled out, the path must not leak
+    // into the paging buttons or beyond the tab strip. Clip to the viewport's
+    // x range only: the path intentionally extends below the viewport (down to
+    // the window bottom) and protrudes horizontally by bottomRadius at the
+    // joins, so a full rect clip would wrongly cut those areas in the normal,
+    // non-scrolled case.
+    const QPalette::ColorGroup group = isActiveWindow() ? QPalette::Active : QPalette::Inactive;
+    if (visibleRect != fullRect) {
+        const QRect viewportRect = bottomBar->tabViewportRect();
+        const QPoint viewportTopLeft = bottomBar->mapTo(this, viewportRect.topLeft());
+        painter.save();
+        painter.setClipRect(QRect(viewportTopLeft.x(), 0, viewportRect.width(), height()));
+        painter.fillPath(selectedPath, palette().color(group, QPalette::Base));
+        painter.restore();
+    } else {
+        painter.fillPath(selectedPath, palette().color(group, QPalette::Base));
+    }
 }
 
 int TitleBarWidget::calculateRemainingWidth() const
@@ -445,6 +560,13 @@ void TitleBarWidget::initConnect()
 
     connect(this, &TitleBarWidget::currentUrlChanged, searchEditWidget, &SearchEditWidget::onUrlChanged);
 
+    connect(DConfigManager::instance(), &DConfigManager::valueChanged, this, [this](const QString &config, const QString &key) {
+        if (config == kSearchDConfName && key == kConfigEnableSearch) {
+            bool enabled = DConfigManager::instance()->value(kSearchDConfName, kConfigEnableSearch, true).toBool();
+            searchEditWidget->setVisible(enabled);
+        }
+    });
+
     connect(bottomBar, &TabBar::newTabCreated, this, &TitleBarWidget::onTabCreated);
     connect(bottomBar, &TabBar::requestCreateView, this, &TitleBarWidget::handleCreateView);
     connect(bottomBar, &TabBar::tabAboutToRemove, this, &TitleBarWidget::onTabAboutToRemove);
@@ -452,12 +574,34 @@ void TitleBarWidget::initConnect()
     connect(bottomBar, &TabBar::currentTabChanged, this, &TitleBarWidget::onTabCurrentChanged);
     connect(bottomBar, &TabBar::tabCloseRequested, this, &TitleBarWidget::onTabCloseRequested);
     connect(bottomBar, &TabBar::tabAddRequested, this, &TitleBarWidget::onTabAddButtonClicked);
+    // The selected-tab highlight is painted here and extends below the tab
+    // strip's viewport, while internal scrolling repaints that viewport only;
+    // re-run this paintEvent whenever the visible tab geometry shifts.
+    connect(bottomBar, &TabBar::viewportScrolled, this, QOverload<>::of(&TitleBarWidget::update));
+    // Live-follow the dragged tab: the drag snapshot's real geometry (relayed
+    // by TabBar) feeds the highlight painted in paintEvent.
+    connect(bottomBar, &TabBar::tabDragStarted, this, [this](int) {
+        tabDragActive = true;
+        update();
+    });
+    connect(bottomBar, &TabBar::tabDragMoved, this, [this](const QRect &rect) {
+        tabDragRect = rect;
+        update();
+    });
+    connect(bottomBar, &TabBar::tabDragEnded, this, [this]() {
+        tabDragActive = false;
+        tabDragRect = QRect();
+        update();
+    });
 
 #ifdef DTKWIDGET_CLASS_DSizeMode
     connect(DGuiApplicationHelper::instance(), &DGuiApplicationHelper::sizeModeChanged, this, [this]() {
         updateUiForSizeMode();
     });
 #endif
+    connect(DGuiApplicationHelper::instance(), &DGuiApplicationHelper::themeTypeChanged, this, [this]() {
+        update();
+    });
 }
 
 void TitleBarWidget::updateUiForSizeMode()
@@ -506,13 +650,15 @@ void TitleBarWidget::showCrumbBar()
         addressBar->clear();
         addressBar->hide();
     }
-    QMetaObject::invokeMethod(this, [this] {
-        QWidget *focusWidget = QApplication::focusWidget();
-        if (!focusWidget || focusWidget == addressBar
-            || addressBar->isAncestorOf(focusWidget)) {
-            setFocus();
-        }
-    }, Qt::QueuedConnection);
+    QMetaObject::invokeMethod(
+            this, [this] {
+                QWidget *focusWidget = QApplication::focusWidget();
+                if (!focusWidget || focusWidget == addressBar
+                    || addressBar->isAncestorOf(focusWidget)) {
+                    setFocus();
+                }
+            },
+            Qt::QueuedConnection);
 }
 
 void TitleBarWidget::showSearchFilterButton(bool visible)
@@ -630,17 +776,20 @@ void TitleBarWidget::handleCreateView(const QString &uniqueId)
 void TitleBarWidget::onTabCreated()
 {
     curNavWidget->addHistroyStack();
+    update();
 }
 
 void TitleBarWidget::onTabAboutToRemove(int oldIndex, int nextIndex)
 {
     TitleBarEventCaller::sendTabRemoved(this, tabBar()->tabUniqueId(oldIndex), tabBar()->tabUniqueId(nextIndex));
     curNavWidget->removeNavStackAt(oldIndex);
+    update();
 }
 
 void TitleBarWidget::onTabMoved(int from, int to)
 {
     curNavWidget->moveNavStacks(from, to);
+    update();
 }
 
 void TitleBarWidget::resizeEvent(QResizeEvent *event)
@@ -691,6 +840,8 @@ void TitleBarWidget::onTabCurrentChanged(int oldIndex, int newIndex)
         TitleBarEventCaller::sendChangeCurrentUrl(this, tabBar()->tabUrl(newIndex));
         restoreTitleBarState(tabBar()->tabUniqueId(newIndex));
     }
+
+    update();
 }
 
 void TitleBarWidget::onTabCloseRequested(int index)

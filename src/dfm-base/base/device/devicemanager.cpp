@@ -27,6 +27,9 @@
 #include <QDBusConnectionInterface>
 #include <QDBusMessage>
 #include <QApplication>
+#include <QTimer>
+#include <functional>
+#include <memory>
 
 #include <dfm-mount/dmount.h>
 #include <mutex>
@@ -36,10 +39,6 @@ using namespace dfmbase;
 DFM_MOUNT_USE_NS
 using namespace GlobalServerDefines;
 using namespace GlobalDConfDefines::ConfigPath;
-
-static constexpr char kSavePasswd[] { "savePasswd" };
-static constexpr char kStashedSmbDevices[] { "StashedSmbDevices" };
-static constexpr char kSavedPasswordType[] { "SavedPasswordType" };
 
 static constexpr char kDaemonService[] { "org.deepin.Filemanager.MountControl" };
 static constexpr char kDaemonPath[] { "/org/deepin/Filemanager/MountControl" };
@@ -55,8 +54,12 @@ static constexpr char kDlnfsIface[] { "org.deepin.dlnfs.Control" };
 
 DeviceManager *DeviceManager::instance()
 {
-    static DeviceManager ins;
-    return &ins;
+    // Intentionally leaked: destruction order of static singletons at process
+    // exit is unpredictable, while pooled/async tasks (e.g. device usage
+    // queries) may still emit signals on this singleton afterwards. Leaking
+    // keeps those emits safe (same approach as InfoCache::instance()).
+    static DeviceManager *ins = new DeviceManager();
+    return ins;
 }
 
 // DeviceManager instance might be used in different process,
@@ -249,10 +252,8 @@ bool DeviceManager::unmountBlockDev(const QString &id, const QVariantMap &opts)
     }
 
     auto mpt = dev->mountPoint();
-    if (!mpt.isEmpty() && !DeviceHelper::askForStopScanning(QUrl::fromLocalFile(mpt))) {
-        qCWarning(logDFMBase) << "Cannot unmount device, scanning operation in progress:" << id << "mount point:" << mpt;
-        return false;
-    }
+    if (!mpt.isEmpty() && !DeviceHelper::askForStopScanning(QUrl::fromLocalFile(mpt)))
+        qCWarning(logDFMBase) << "user rejected stop scanning, continue unmounting:" << mpt;
 
     if (dev->isEncrypted()) {
         bool noLock = opts.value(OperateParamField::kUnmountWithoutLock, false).toBool();
@@ -305,9 +306,7 @@ void DeviceManager::unmountBlockDevAsync(const QString &id, const QVariantMap &o
     }
 
     if (!mpt.isEmpty() && !DeviceHelper::askForStopScanning(QUrl::fromLocalFile(mpt))) {
-        if (cb)
-            cb(false, Utils::genOperateErrorInfo(DeviceError::kUDisksErrorDeviceBusy));
-        return;
+        qCWarning(logDFMBase) << "user rejected stop scanning, continue unmounting:" << mpt;
     }
 
     if (dev->isEncrypted()) {
@@ -333,13 +332,31 @@ void DeviceManager::unmountBlockDevAsync(const QString &id, const QVariantMap &o
         });
     } else {
         DeviceManagerPrivate::unmountStackedMount(mpt);
-        dev->unmountAsync(opts, [cb, this, id](bool ok, const OperationErrorInfo &err) {
+
+        // Retry on DeviceBusy with 2s delay, up to 3 attempts.
+        // unmountStackedMount is NOT re-called on retry (already done above).
+        const int maxRetries = 3;
+        auto retryCount = QSharedPointer<int>::create(0);
+        auto retryCb = std::make_shared<std::function<void(bool, const OperationErrorInfo &)>>();
+
+        *retryCb = [cb, this, id, retryCount, maxRetries, dev, opts, retryCb](bool ok, const OperationErrorInfo &err) {
             qCInfo(logDFMBase) << "unmount device finished: " << id << ok << err.code << err.message;
+            if (!ok && err.code == DeviceError::kUDisksErrorDeviceBusy && *retryCount < maxRetries) {
+                (*retryCount)++;
+                qCInfo(logDFMBase) << "device busy, retrying unmount (" << *retryCount << "/" << maxRetries << "):" << id;
+                QTimer::singleShot(2000, [retryCb, dev, opts]() {
+                    dev->unmountAsync(opts, *retryCb);
+                });
+                return;
+            }
             if (cb)
                 cb(ok, err);
             if (!ok)
                 emit blockDevUnmountAsyncFailed(id, err.code);
-        });
+            *retryCb = nullptr;
+        };
+
+        dev->unmountAsync(opts, *retryCb);
     }
 }
 
@@ -578,7 +595,10 @@ void DeviceManager::unmountProtocolDevAsync(const QString &id, const QVariantMap
 void DeviceManager::mountNetworkDeviceAsync(const QString &address, CallbackType1 cb, int timeout)
 {
     //    Q_ASSERT(qApp->thread() == QThread::currentThread());
-    Q_ASSERT_X(!address.isEmpty(), __FUNCTION__, "address is emtpy");
+    if (address.isEmpty()) {
+        qCWarning(logDFMBase) << "mountNetworkDeviceAsync: address is empty";
+        return;
+    }
     QUrl u(address);
     if (!u.isValid()) {
         qCWarning(logDFMBase) << "url is not valid: " << u << address;
@@ -979,14 +999,11 @@ void DeviceManagerPrivate::handleDlnfsMount(const QString &mpt, bool mount)
 
 void DeviceManagerPrivate::unmountStackedMount(const QString &mpt)
 {
-    // TODO: Not sure what this code does, will look at it when something goes wrong
-#if 0
     QDBusInterface iface(kDaemonService, kDaemonMountPath, kDaemonMountIface, QDBusConnection::systemBus());
     QDBusReply<QVariantMap> reply = iface.call("Unmount", mpt,
                                                QVariantMap { { "fsType", "common" }, { "unmountAllStacked", true } });
     const auto &ret = reply.value();
     qCDebug(logDFMBase) << "unmount all stacked mount of: " << mpt << ret;
-#endif
 }
 
 MountPassInfo DeviceManagerPrivate::askForPasswdWhenMountNetworkDevice(const QString &message, const QString &userDefault,

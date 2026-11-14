@@ -9,6 +9,7 @@
 #include "interface/canvasviewshell.h"
 #include "desktoputils/ddplugin_eventinterface_helper.h"
 #include "menus/extendcanvasscene.h"
+#include "view/collectionview.h"
 
 #include "plugins/common/dfmplugin-menu/menu_eventinterface_helper.h"
 
@@ -46,9 +47,8 @@ FrameManagerPrivate::FrameManagerPrivate(FrameManager *qq)
     layoutTimer->setInterval(1000);
     layoutTimer->setSingleShot(true);
     connect(layoutTimer, &QTimer::timeout, this, [this] {
-        if (organizer) {
-            organizer->layout();
-        }
+        if (q)
+            q->layout();
     });
 
     hideAllNotifyExpireTimer = new QTimer(this);
@@ -144,6 +144,20 @@ void FrameManagerPrivate::layoutSurface(QWidget *root, SurfacePointer surface, b
     }
 }
 
+void FrameManagerPrivate::refreshCollectionViews()
+{
+    for (const auto &surface : surfaceWidgets) {
+        if (!surface)
+            continue;
+
+        const auto views = surface->findChildren<CollectionView *>();
+        for (auto *view : views) {
+            view->updateRegionView();
+            view->viewport()->update();
+        }
+    }
+}
+
 void FrameManagerPrivate::buildOrganizer()
 {
     q->switchMode(CfgPresenter->mode());
@@ -189,7 +203,7 @@ void FrameManagerPrivate::onHideAllKeyPressed()
         QString cmdNoRepeation = "dde-dconfig,--set,-a,org.deepin.dde.file-manager,-r,org.deepin.dde.file-manager.desktop.organizer,-k,hideAllDialogRepeatNoMore,-v,true";
         auto sendHideAllNotification = std::make_shared<std::function<void(quint32, bool)>>();
         *sendHideAllNotification = [this, keySequence, tips, cmdNoRepeation, sendHideAllNotification](quint32 replacesId, bool allowRetry) {
-            QString cmdCloseNotify = QString("dbus-send,--type=method_call,--dest=org.freedesktop.Notifications,/org/freedesktop/Notifications,com.deepin.dde.Notification.CloseNotification,uint32:%1")
+            QString cmdCloseNotify = QString("dbus-send,--type=method_call,--dest=org.freedesktop.Notifications,/org/freedesktop/Notifications,org.freedesktop.Notifications.CloseNotification,uint32:%1")
                                              .arg(replacesId);
             QDBusPendingCall pendingReply = DDBusSender()
                                                     .service("org.freedesktop.Notifications")
@@ -389,8 +403,12 @@ bool FrameManager::initialize()
 
 void FrameManager::layout()
 {
-    if (d->organizer)
+    if (d->organizer) {
         d->organizer->layout();
+        // A screen geometry change may leave collection frames at the same size,
+        // so their resizeEvent cannot refresh cached item and text metrics.
+        d->refreshCollectionViews();
+    }
 }
 
 void FrameManager::switchMode(OrganizerMode mode)
@@ -538,7 +556,6 @@ void FrameManager::onGeometryChanged()
             d->layoutSurface(win, surface);
     }
 
-    // layout collection widgets
-    if (d->organizer)
-        d->organizer->layout();
+    // layout collection widgets and refresh their cached item metrics
+    layout();
 }

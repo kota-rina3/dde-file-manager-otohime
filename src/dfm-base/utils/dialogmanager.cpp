@@ -168,7 +168,7 @@ void DialogManager::showErrorDialogWhenOperateDeviceFailed(OperateType type, DFM
                      && err.code <= DeviceError::kGIOErrorMessageTooLarge))
             errMsg = err.message;
         else
-            errMsg = tr("Authentication failed");
+            errMsg = tr("Error occurred while mounting device");
 
         if (err.message.contains("Operation not permitted.")) {   // TASK(222725)
             errMsg = tr("The device has been blocked and you do not have permission to access it. "
@@ -298,7 +298,13 @@ void DialogManager::showSetingsDialog(FileManagerWindow *window, const QString &
     }
 
     if (window->property("isSettingDialogShown").toBool()) {
-        qCWarning(logDFMBase) << "isSettingDialogShown true";
+        // The settings dialog is already open for this window: bring it to the
+        // front instead of silently ignoring the repeated request.
+        if (auto *dsd = window->findChild<DSettingsDialog *>()) {
+            dsd->show();
+            dsd->raise();
+            dsd->activateWindow();
+        }
         return;
     }
 
@@ -430,7 +436,18 @@ int DialogManager::showDeleteFilesDialog(const QList<QUrl> &urlList, bool isTras
         title = DeleteFileItems.arg(urlList.size());
     }
 
-    DDialog d(qApp->activeWindow());
+    // Don't parent the stack-allocated dialog to a window that may be destroyed
+    // during this dialog's own nested event loop. A WA_DeleteOnClose transient
+    // popup (e.g. TagEditor) closes and deleteLater()-destroys itself once it
+    // loses focus to this dialog; the deferred delete is processed inside
+    // d.exec(), and ~TagEditor -> deleteChildren would then `delete` this
+    // stack object, causing a double-free / corruption crash. Fall back to the
+    // parentless WindowStaysOnTopHint branch below for such windows.
+    QWidget *parent = qApp->activeWindow();
+    if (parent && parent->testAttribute(Qt::WA_DeleteOnClose))
+        parent = nullptr;
+
+    DDialog d(parent);
     if (!d.parentWidget()) {
         d.setWindowFlags(d.windowFlags() | Qt::WindowStaysOnTopHint);
     }

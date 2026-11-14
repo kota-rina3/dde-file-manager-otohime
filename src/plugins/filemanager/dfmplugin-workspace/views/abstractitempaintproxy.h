@@ -7,6 +7,8 @@
 
 #include "dfmplugin_workspace_global.h"
 
+#include <dfm-base/utils/iconpainterutils.h>
+
 #include <QObject>
 #include <QPainter>
 #include <QStyleOptionViewItem>
@@ -33,7 +35,8 @@ public:
 
     void setStyleProxy(QStyle *style);
 protected:
-    bool isThumnailIconIndex(const QModelIndex &index) const;
+    bool isThumbnailIconIndex(const QModelIndex &index) const;
+    bool skipThumbnailFrame(const QModelIndex &index) const;
 
 protected:
     QStyle *style;

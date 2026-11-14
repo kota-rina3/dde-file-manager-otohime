@@ -354,6 +354,10 @@ void TaskWidget::onShowTaskProccess(const JobInfoPointer JobInfo)
         value = 100;
     }
 
+    // value must not go backward (PMS bug 117471), e.g. when the total size
+    // is re-resolved during the job and the percentage would drop
+    value = value > preValue ? value : preValue;
+
     if (value > 0 && value == preValue) {
         // value not change, return
         return;
@@ -506,13 +510,13 @@ QWidget *TaskWidget::createConflictWidget()
     conflictMainLayout->addWidget(lbSrcIcon, 0, 0, 2, 1, Qt::AlignVCenter);
     conflictMainLayout->addWidget(lbSrcTitle, 0, 1, 1, 2, Qt::AlignVCenter);
     conflictMainLayout->addWidget(lbSrcModTime, 1, 1, Qt::AlignVCenter);
-    conflictMainLayout->addWidget(lbSrcFileSize, 1, 2, Qt::AlignVCenter);
+    conflictMainLayout->addWidget(lbSrcFileSize, 1, 2, Qt::AlignVCenter | Qt::AlignRight);
 
     if (createDestLabels) {
         conflictMainLayout->addWidget(lbDstIcon, 2, 0, 2, 1, Qt::AlignVCenter);
         conflictMainLayout->addWidget(lbDstTitle, 2, 1, 1, 2, Qt::AlignVCenter);
         conflictMainLayout->addWidget(lbDstModTime, 3, 1, Qt::AlignVCenter);
-        conflictMainLayout->addWidget(lbDstFileSize, 3, 2, Qt::AlignVCenter);
+        conflictMainLayout->addWidget(lbDstFileSize, 3, 2, Qt::AlignVCenter | Qt::AlignRight);
     }
 
     conflictMainLayout->setHorizontalSpacing(4);
@@ -542,19 +546,27 @@ QWidget *TaskWidget::createBtnWidget()
     QVariant variantCoexit;
     variantCoexit.setValue<AbstractJobHandler::SupportAction>(AbstractJobHandler::SupportAction::kCoexistAction);
     btnCoexist = new DPushButton(TaskWidget::tr("Keep both", "button"));
+    btnCoexist->setObjectName("BtnCoexist");
+    btnCoexist->setAccessibleName("BtnCoexist");
     btnCoexist->setProperty(kBtnPropertyActionName, variantCoexit);
 
     btnSkip = new DPushButton(TaskWidget::tr("Skip", "button"));
+    btnSkip->setObjectName("BtnSkip");
+    btnSkip->setAccessibleName("BtnSkip");
     QVariant variantSkip;
     variantSkip.setValue<AbstractJobHandler::SupportAction>(AbstractJobHandler::SupportAction::kSkipAction);
     btnSkip->setProperty(kBtnPropertyActionName, variantSkip);
 
     btnReplace = new DPushButton(TaskWidget::tr("Replace", "button"));
+    btnReplace->setObjectName("BtnReplace");
+    btnReplace->setAccessibleName("BtnReplace");
     QVariant variantReplace;
     variantReplace.setValue<AbstractJobHandler::SupportAction>(AbstractJobHandler::SupportAction::kReplaceAction);
     btnReplace->setProperty(kBtnPropertyActionName, variantReplace);
 
     btnDelete = new DWarningButton();
+    btnDelete->setObjectName("BtnDelete");
+    btnDelete->setAccessibleName("BtnDelete");
     btnDelete->setText(TaskWidget::tr("Permanently delete", "button"));
     QVariant varianDelete;
     varianDelete.setValue<AbstractJobHandler::SupportAction>(AbstractJobHandler::SupportAction::kPermanentlyDelete);
@@ -583,6 +595,8 @@ QWidget *TaskWidget::createBtnWidget()
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
     chkboxNotAskAgain = new QCheckBox(TaskWidget::tr("Do not ask again"));
+    chkboxNotAskAgain->setObjectName("ChkboxNotAskAgain");
+    chkboxNotAskAgain->setAccessibleName("ChkboxNotAskAgain");
     layout->addSpacing(100);
     layout->addWidget(chkboxNotAskAgain);
 
@@ -654,6 +668,7 @@ QWidget *TaskWidget::createBaseWidget()
     hLayout3->addWidget(lbErrorMsg, Qt::AlignLeft);
 
     btnStop = new DIconButton(this);
+    btnStop->setAccessibleName("BtnStop");
     btnStop->setObjectName("TaskWidgetStopButton");
     QVariant variantStop;
     variantStop.setValue<AbstractJobHandler::SupportAction>(AbstractJobHandler::SupportAction::kStopAction);
@@ -665,6 +680,7 @@ QWidget *TaskWidget::createBaseWidget()
     btnStop->setAttribute(Qt::WA_NoMousePropagation);
 
     btnPause = new DIconButton(this);
+    btnPause->setAccessibleName("BtnPause");
     btnPause->setObjectName("TaskWidgetPauseButton");
     QVariant variantPause;
     variantPause.setValue<AbstractJobHandler::SupportAction>(AbstractJobHandler::SupportAction::kPauseAction);
@@ -778,6 +794,7 @@ void TaskWidget::onMouseHover(const bool hover)
     }
 
     adjustSize();
+    update();
 }
 
 QString TaskWidget::formatTime(qint64 second) const

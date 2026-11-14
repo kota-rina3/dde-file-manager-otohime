@@ -10,6 +10,7 @@
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
 #include <QDBusPendingReply>
+#include <QDBusServiceWatcher>
 #include <QMap>
 #include <QThread>
 
@@ -20,6 +21,23 @@ AbstractIndexClient::AbstractIndexClient(IndexClientDescriptor descriptor, QObje
     : QObject(parent),
       m_descriptor(std::move(descriptor))
 {
+    // 事件驱动监测后端服务注册/注销（与 daemon-core 插件同构）：服务退出时立即
+    // 通知界面显示错误状态而不是转圈等待，重新上线时触发重查询自愈
+    serviceWatcher = new QDBusServiceWatcher(m_descriptor.dbusServiceName,
+                                             QDBusConnection::sessionBus(),
+                                             QDBusServiceWatcher::WatchForRegistration
+                                                     | QDBusServiceWatcher::WatchForUnregistration,
+                                             this);
+    connect(serviceWatcher, &QDBusServiceWatcher::serviceRegistered, this, [this]() {
+        fmInfo() << "[" << m_descriptor.clientName << "] backend service registered";
+        emit serviceAvailabilityChanged(true);
+    });
+    connect(serviceWatcher, &QDBusServiceWatcher::serviceUnregistered, this, [this]() {
+        fmWarning() << "[" << m_descriptor.clientName << "] backend service unregistered";
+        // 旧代理随服务消亡：丢弃以触发下次调用时重新拉起服务并重建
+        interface.reset();
+        emit serviceAvailabilityChanged(false);
+    });
 }
 
 AbstractIndexClient::~AbstractIndexClient() = default;
@@ -66,6 +84,8 @@ bool AbstractIndexClient::ensureInterface()
             this, SLOT(onDBusTaskFinished(QString, QString, bool)));
     connect(interface.get(), SIGNAL(TaskProgressChanged(QString, QString, qlonglong, qlonglong)),
             this, SLOT(onDBusTaskProgressChanged(QString, QString, qlonglong, qlonglong)));
+    connect(interface.get(), SIGNAL(IndexStatusChanged(QString, QString)),
+            this, SLOT(onDBusIndexStatusChanged(QString, QString)));
 
     fmInfo() << "[" << m_descriptor.clientName << "] interface successfully initialized";
     return true;
@@ -309,16 +329,6 @@ void AbstractIndexClient::getLastUpdateTime()
             });
 }
 
-void AbstractIndexClient::setEnable(bool enabled)
-{
-    if (!ensureInterface()) {
-        fmWarning() << "[" << m_descriptor.clientName << "] cannot set enabled state: interface unavailable";
-        return;
-    }
-
-    interface->asyncCall(QStringLiteral("SetEnabled"), enabled);
-}
-
 void AbstractIndexClient::handleGetLastUpdateTimeReply(QDBusPendingCallWatcher *watcher)
 {
     FinallyUtil finaly([watcher]() {
@@ -332,4 +342,63 @@ void AbstractIndexClient::handleGetLastUpdateTimeReply(QDBusPendingCallWatcher *
     } else {
         emit lastUpdateTimeResult(reply.value(), true);
     }
+}
+
+void AbstractIndexClient::getIndexStatus()
+{
+    if (!ensureInterface()) {
+        fmWarning() << "[" << m_descriptor.clientName << "] cannot get index status: interface unavailable";
+        emit indexStatusResult(QString(), QString(), false);
+        return;
+    }
+
+    auto watcher = new QDBusPendingCallWatcher(interface->asyncCall(QStringLiteral("GetIndexStatus")), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished,
+            this, [this](QDBusPendingCallWatcher *watcher) {
+                FinallyUtil finaly([watcher]() { watcher->deleteLater(); });
+                QDBusPendingReply<QVariantMap> reply = *watcher;
+
+                if (reply.isError()) {
+                    fmWarning() << "[" << m_descriptor.clientName << "] get index status failed:" << reply.error().message();
+                    emit indexStatusResult(QString(), QString(), false);
+                    return;
+                }
+
+                const QVariantMap status = reply.value();
+                const QString state = status.value("state").toString();
+                const QString grade = status.value("grade").toString();
+                emit indexStatusResult(state, grade, true);
+            });
+}
+
+void AbstractIndexClient::forceUpdateIndex(const QStringList &paths)
+{
+    if (!ensureInterface()) {
+        fmCritical() << "[" << m_descriptor.clientName << "] cannot force update: interface unavailable";
+        return;
+    }
+
+    fmInfo() << "[" << m_descriptor.clientName << "] requesting force update for" << paths.size() << "paths";
+    QVariantMap options;
+    options["manual"] = true;
+    interface->asyncCall(QStringLiteral("ForceUpdateIndex"), QVariant::fromValue(paths), options);
+}
+
+void AbstractIndexClient::updateIndexBypassEnv(const QStringList &paths)
+{
+    if (!ensureInterface()) {
+        fmCritical() << "[" << m_descriptor.clientName << "] cannot update (bypass env): interface unavailable";
+        return;
+    }
+
+    fmInfo() << "[" << m_descriptor.clientName << "] requesting update (bypass env, CPU limited) for" << paths.size() << "paths";
+    QVariantMap options;
+    options["manual"] = false;
+    interface->asyncCall(QStringLiteral("ForceUpdateIndex"), QVariant::fromValue(paths), options);
+}
+
+void AbstractIndexClient::onDBusIndexStatusChanged(const QString &state, const QString &grade)
+{
+    fmDebug() << "[" << m_descriptor.clientName << "] index status changed - state:" << state << "grade:" << grade;
+    emit indexStatusChanged(state, grade);
 }

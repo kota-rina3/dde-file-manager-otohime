@@ -32,6 +32,8 @@ RecoveryKeyView::RecoveryKeyView(QWidget *parent)
 {
     //! 密钥编辑框
     recoveryKeyEdit = new QPlainTextEdit(this);
+    recoveryKeyEdit->setObjectName("RecoveryKeyEdit");
+    recoveryKeyEdit->setAccessibleName("RecoveryKeyEdit");
     recoveryKeyEdit->setPlaceholderText(tr("Input the 32-digit recovery key"));
     recoveryKeyEdit->setMaximumBlockCount(MAX_KEY_LENGTH + 3);
     recoveryKeyEdit->installEventFilter(this);
@@ -72,6 +74,7 @@ void RecoveryKeyView::showAlertMessage(const QString &text, int duration)
 {
     if (!tooltip) {
         tooltip = new DToolTip(text);
+        tooltip->setAccessibleName("Tooltip");
         tooltip->setObjectName("AlertTooltip");
         tooltip->setForegroundRole(DPalette::TextWarning);
         tooltip->setWordWrap(true);

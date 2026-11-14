@@ -58,6 +58,7 @@ public slots:
     void handleHotketActivateTab(const int index);
 
 protected:
+    void paintEvent(QPaintEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void showEvent(QShowEvent *event) override;
 
@@ -103,6 +104,8 @@ private:
     QWidget *placeholder { nullptr };
 
     bool searchButtonSwitchState { false };
+    bool tabDragActive { false };
+    QRect tabDragRect;
 
     struct TitleBarState
     {

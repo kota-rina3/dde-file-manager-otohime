@@ -166,12 +166,18 @@ bool DiskEncryptMenuScene::initialize(const QVariantHash &params)
     param.deviceDisplayName = info->displayOf(dfmbase::FileInfo::kFileDisplayName);
     param.secType = SecKeyType::kPwd;
 
+    param.devPhy = EventsHandler::instance()->holderDevice(device);
+
     if (param.states != kStatusNotEncrypted) {
         param.secType = static_cast<SecKeyType>(device_utils::encKeyType(device));
         fmDebug() << "Device encryption finished, security type:" << param.secType;
+    } else {
+        const QString &pendingDev = EventsHandler::instance()->unfinishedDecryptJob();
+        if (pendingDev == device || pendingDev == param.devPhy) {
+            param.secType = static_cast<SecKeyType>(device_utils::encKeyType(device));
+            fmDebug() << "Device has unfinished decrypt job, security type:" << param.secType;
+        }
     }
-
-    param.devPhy = EventsHandler::instance()->holderDevice(device);
 
     return true;
 }
@@ -392,6 +398,7 @@ void DiskEncryptMenuScene::unlockDevice(const QString &devObjPath)
 void DiskEncryptMenuScene::doEncryptDevice(const DeviceEncryptParam &param)
 {
     CREATE_DAEMON_INTERFACE(iface);
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmCritical() << "Failed to create DBus interface for InitEncryption, service may be unavailable";
         return;
@@ -437,6 +444,7 @@ bool DiskEncryptMenuScene::doReencryptDevice(const DeviceEncryptParam &param)
     }
 
     CREATE_DAEMON_INTERFACE(iface);
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmCritical() << "Failed to create DBus interface for SetupAuthArgs, service may be unavailable";
         return false;
@@ -466,6 +474,7 @@ bool DiskEncryptMenuScene::doReencryptDevice(const DeviceEncryptParam &param)
 void DiskEncryptMenuScene::doDecryptDevice(const DeviceEncryptParam &param)
 {
     CREATE_DAEMON_INTERFACE(iface);
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmCritical() << "Failed to create DBus interface for Decryption, service may be unavailable";
         return;
@@ -521,6 +530,7 @@ void DiskEncryptMenuScene::doChangePassphrase(const DeviceEncryptParam &param)
     }
 
     CREATE_DAEMON_INTERFACE(iface);
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmCritical() << "Failed to create DBus interface for ChangePassphrase, service may be unavailable";
         return;
@@ -846,7 +856,32 @@ void DiskEncryptMenuScene::updateActions()
         // Defensive check: only show "Continue decrypt" if device is actually LUKS encrypted.
         // This handles the case where the partition was reformatted after a decrypt job was interrupted.
         const QString &idType = selectedItemInfo.value("IdType").toString();
-        if (idType == "crypto_LUKS") {
+        // For overlay encryption, the device has a 2-layer DM structure:
+        // e.g. nvme0n1p5 -> usec-overlay-unlock-home (crypt/LUKS) -> usec-overlay-home (top).
+        // The top overlay layer is not crypto_LUKS itself, but it sits on top of a crypt layer,
+        // so the resume decrypt option should also be shown for overlay devices.
+        // The top overlay device's symlinks only contain "usec-overlay-xxx" (not "usec-overlay-unlock-xxx"),
+        // so we derive the unlock device name from the overlay name and check if it exists.
+        // Naming rule (see DMInitEncryptWorker): "overlay" -> "overlay-unlock".
+        bool hasOverlayCrypt = false;
+        if (idType != "crypto_LUKS") {
+            auto devSymlinks = selectedItemInfo.value("Symlinks").toStringList();
+            for (const QString &symlink : devSymlinks) {
+                int idx = symlink.indexOf(kOverleyEncPrefix);
+                if (idx < 0)
+                    continue;
+                // Extract the overlay device name, e.g. "usec-overlay-home"
+                QString overlayName = symlink.mid(idx);
+                // Derive the unlock device name, e.g. "usec-overlay-unlock-home"
+                QString unlockName = QString(overlayName).replace("overlay", "overlay-unlock");
+                QString unlockDevPath = "/dev/mapper/" + unlockName;
+                if (QFile::exists(unlockDevPath)) {
+                    hasOverlayCrypt = true;
+                    break;
+                }
+            }
+        }
+        if (idType == "crypto_LUKS" || hasOverlayCrypt) {
             actions[kActIDResumeDecrypt]->setVisible(true);
         } else {
             fmInfo() << "Device has pending decrypt job but is not LUKS (may have been reformatted), hiding resume decrypt option:" << param.devDesc << "idType:" << idType;

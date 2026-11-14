@@ -40,6 +40,7 @@ void OpenWithWidget::initUI()
     setExpand(false);
 
     openWithListWidget = new QListWidget(this);
+    openWithListWidget->setAccessibleName("OpenWithListWidget");
     openWithListWidget->setSpacing(8);
     openWithListWidget->setObjectName("OpenWithListWidget");
     openWithListWidget->setFrameShape(QFrame::HLine);
@@ -49,6 +50,7 @@ void OpenWithWidget::initUI()
     DFontSizeManager::instance()->bind(openWithListWidget, DFontSizeManager::SizeType::T7, QFont::Normal);
 
     openWithBtnGroup = new QButtonGroup(openWithListWidget);
+    openWithBtnGroup->setObjectName("OpenWithBtnGroup");
 
     this->setContent(openWithListWidget);
 

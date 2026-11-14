@@ -50,12 +50,16 @@ VideoStatusBar::VideoStatusBar(VideoPreview *preview)
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 
     controlButton = new DIconButton(this);
+    controlButton->setObjectName("ControlButton");
+    controlButton->setAccessibleName("ControlButton");
     controlButton->setIconSize({ kControlButtonIconSize, kControlButtonIconSize });
     controlButton->installEventFilter(this);
     updateControlButtonIcon();
 
     slider->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     slider->setMinimum(0);
+    slider->setObjectName("Slider_2");
+    slider->setAccessibleName("Slider_2");
 
     QHBoxLayout *layout = new QHBoxLayout(this);
 

@@ -14,6 +14,7 @@
 #include <dfm-base/utils/loggerrules.h>
 #include <dfm-base/utils/windowutils.h>
 #include <dfm-base/utils/signalhandler.h>
+#include <dfm-base/utils/timezonewatcher.h>
 #include <dfm-base/base/configs/dconfig/dconfigmanager.h>
 
 #include <dfm-framework/dpf.h>
@@ -146,6 +147,13 @@ static bool blackListFilter(const QString &name)
         if (isAdmin && !blackNames.contains("dfmplugin-smbbrowser"))
             blackNames << "dfmplugin-smbbrowser";
 #endif
+        /*
+         * NOTE: the tag plugin relies on user-level services/databases that are
+         * unavailable in admin (root) mode, causing tags to silently fail.
+         * Remove the tag plugin in admin mode to avoid a broken UX.
+         */
+        if (isAdmin && !blackNames.contains("dfmplugin-tag"))
+            blackNames << "dfmplugin-tag";
         static QStringList disableNames { DConfigManager::instance()->value(kPluginsDConfName, "filemanager.disablelist").toStringList() };
         std::copy_if(disableNames.begin(), disableNames.end(), std::back_inserter(blackNames),
                      [](const QString &name) {
@@ -255,6 +263,9 @@ static void initEnv()
         }
         setEnvForRoot();
     }
+
+    // 启动时区监视器和时区环境变量设置
+    dfmbase::TimezoneWatcher::instance().init();
 }
 
 static void initLogFilter()

@@ -8,6 +8,7 @@
 #include "dfmplugin_sidebar_global.h"
 
 #include <DTreeView>
+#include <optional>
 
 DWIDGET_USE_NAMESPACE
 
@@ -32,12 +33,22 @@ public:
     void saveStateWhenClose();
     void setCurrentUrl(const QUrl &sidebarUrl);
     QUrl currentUrl() const;
+    bool isCurrentUrlHighlightIndex(const QModelIndex &index) const;
     QModelIndex findItemIndex(const QUrl &url) const;
     QVariantMap groupExpandState() const;
     QModelIndex previousIndex() const;
     void setPreviousIndex(const QModelIndex &index);
     bool isDropTarget(const QModelIndex &index) const;
     bool isSideBarItemDragged() const;
+    bool isDraggedSource(const QModelIndex &index) const;
+    bool isRenderingDragPreview() const;
+    int dragItemVerticalOffset(const QModelIndex &index, int rowHeight) const;
+    bool isPartitionExpandable() const;
+
+    // Sync the double-click rename trigger with the partition tree-view mode:
+    // when the sidebar tree view (partitionExpandable) is enabled, double-click is
+    // reserved for expanding/collapsing partitions and must not start inline renaming.
+    void updateEditTriggers();
 
 protected:
     void mousePressEvent(QMouseEvent *event) override;
@@ -55,9 +66,12 @@ protected:
 private:
     inline QString dragEventUrls() const;
 
+    mutable std::optional<bool> m_partitionExpandableCache;
+
 public Q_SLOTS:
     void updateSeparatorVisibleState();
     void onChangeExpandState(const QModelIndex &index, bool expand);
+    void onRequestCollapseItem(const QModelIndex &index);
 
 Q_SIGNALS:
     void requestRemoveItem();

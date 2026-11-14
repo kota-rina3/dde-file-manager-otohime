@@ -14,6 +14,9 @@ inline constexpr char kPluginsDConfName[] { "org.deepin.dde.file-manager.plugins
 inline constexpr char kViewDConfName[] { "org.deepin.dde.file-manager.view" };
 inline constexpr char kAnimationDConfName[] { "org.deepin.dde.file-manager.animation" };
 inline constexpr char kDesktopDConfName[] { "org.deepin.dde.file-manager.desktop" };
+inline constexpr char kSearchDConfName[] { "org.deepin.dde.file-manager.search" };
+inline constexpr char kOperationsDConfName[] { "org.deepin.dde.file-manager.operations" };
+inline constexpr char kMountDConfName[] { "org.deepin.dde.file-manager.mount" };
 }   // namespace ConfigPath
 
 /*!
@@ -27,6 +30,9 @@ inline constexpr char kCunstomFixedTabs[] { "dfm.custom.fixedtab" };
 inline constexpr char kPinnedTabs[] { "dfm.pinned.tabs" };
 inline constexpr char kDetailViewRemoteImageMaxSize[] { "dfm.detailview.remote.image.maxsize" };
 inline constexpr char kKeyCanvasInputMethod[] { "enableCanvasInputMethod" };
+inline constexpr char kConfigEnableSearch[] { "dfm.enable.search" };
+inline constexpr char kShowRunExec[] { "dfm.show.run.exec" };
+inline constexpr char kSortLatinFirstZhCn[] { "dfm.sort.latinfirst.zhCn" };
 }   // namespace BaseConfig
 
 /*!

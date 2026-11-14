@@ -6,8 +6,10 @@
 
 #include "desktoputils/widgetutil.h"
 #include "desktoputils/ddplugin_eventinterface_helper.h"
+#include "screen/screenqt.h"
 
 #include <QWindow>
+#include <QSet>
 
 DDPCORE_USE_NAMESPACE
 DFMBASE_USE_NAMESPACE
@@ -36,6 +38,26 @@ void WindowFramePrivate::updateProperty(BaseWindowPointer win, ScreenPointer scr
     }
 }
 
+QScreen *WindowFramePrivate::screenFromScreenPointer(const ScreenPointer &sp)
+{
+    if (auto *qtScreen = qobject_cast<ScreenQt *>(sp.data()))
+        return qtScreen->screen();
+    return nullptr;
+}
+
+bool WindowFramePrivate::windowScreenChanged(const BaseWindowPointer &win, const ScreenPointer &sp)
+{
+    // 检测窗口的 QScreen 是否与目标屏不一致。treeland 重新枚举 output 时
+    // 旧 QScreen 销毁，Qt 自动把窗口移到主屏，导致 QScreen 不匹配。
+    auto *target = screenFromScreenPointer(sp);
+    if (!target)
+        return false;
+    auto *handle = win ? win->windowHandle() : nullptr;
+    if (!handle)
+        return false;
+    return handle->screen() != target;
+}
+
 BaseWindowPointer WindowFramePrivate::createWindow(ScreenPointer sp)
 {
     BaseWindowPointer win(new BaseWindow);
@@ -43,7 +65,13 @@ BaseWindowPointer WindowFramePrivate::createWindow(ScreenPointer sp)
     win->setGeometry(sp->geometry());   // 经过缩放的区域
     fmDebug() << "Window created for screen:" << sp->name() << "geometry:" << sp->geometry() << "window pointer:" << win.get();
 
-    ddplugin_desktop_util::setDesktopWindow(win.get());
+    // 绑定窗口到目标屏：ScreenFromQWindow 会读取 QWindow::screen() 决定 layer
+    // surface 绑定到哪个 wl_output。未显式 setScreen 的顶层窗口在 Wayland 下默认
+    // 落在主屏，导致副屏桌面被绑到主屏 output。对齐 dock 的 winId->setScreen->
+    // DLayerShellWindow::get 顺序。
+    auto *qscreen = screenFromScreenPointer(sp);
+
+    ddplugin_desktop_util::setDesktopWindow(win.get(), qscreen);
     // the Desktop Window is opaque though it has been setted Qt::WA_TranslucentBackground
     // uing setOpacity to set opacity for Desktop Window to be transparent.
     auto handle = win->windowHandle();
@@ -186,6 +214,7 @@ void WindowFrame::buildBaseWindow()
     auto screens = ddplugin_desktop_util::screenProxyLogicScreens();
     fmInfo() << "Display mode:" << mode << "screen count:" << screens.size();
 
+    QSet<QString> skippedHide;
     QWriteLocker lk(&d->locker);
     // 实际是单屏
     if ((DisplayMode::kShowonly == mode) || (DisplayMode::kDuplicate == mode)   // 仅显示和复制
@@ -202,9 +231,25 @@ void WindowFrame::buildBaseWindow()
         }
 
         BaseWindowPointer winPtr = d->windows.value(primary->name());
+        // 先隐藏所有窗口，确保非主屏窗口的 layer-shell surface 被正确销毁，
+        // 避免切换到单屏/复制模式时残留"幽灵桌面"窗口。
+        for (auto &w : d->windows) {
+            if (w != winPtr)
+                w->hide();
+        }
         d->windows.clear();
-        if (!winPtr.isNull()) {
-            if (winPtr->geometry() != primary->geometry()) {
+        bool primaryExisted = !winPtr.isNull();
+        bool primaryRecreated = false;
+        if (primaryExisted) {
+            // Wayland 下 setScreen 无法重建 layer-shell surface，若 QScreen 已变
+            // （output 重枚举后 Qt 把窗口移到主屏），必须销毁旧窗口重建。
+            if (d->windowScreenChanged(winPtr, primary)) {
+                fmInfo() << "QScreen changed for primary screen, recreating window";
+                winPtr->hide();
+                winPtr.reset();
+                winPtr = d->createWindow(primary);
+                primaryRecreated = true;
+            } else if (winPtr->geometry() != primary->geometry()) {
                 winPtr->setGeometry(primary->geometry());
                 fmDebug() << "Updated existing primary window geometry to:" << primary->geometry();
             }
@@ -217,7 +262,11 @@ void WindowFrame::buildBaseWindow()
         d->windows.insert(primary->name(), winPtr);
 
         //! 必须先隐藏，否则后面调用show时无法带动子窗口显示
-        winPtr->hide();
+        if (primaryExisted && !primaryRecreated) {
+            skippedHide.insert(primary->name());
+        } else {
+            winPtr->hide();
+        }
     } else {
         //多屏
         fmInfo() << "Configuring multiple screens";
@@ -232,10 +281,24 @@ void WindowFrame::buildBaseWindow()
         fmInfo() << "primary screen:" << primary->name();
         for (ScreenPointer s : screens) {
             BaseWindowPointer winPtr = d->windows.value(s->name());
-            if (!winPtr.isNull()) {
-                if (winPtr->geometry() != s->geometry())
-                    winPtr->setGeometry(s->geometry());
-                fmInfo() << "Updated window for screen:" << s->name() << "window geometry:" << winPtr->geometry() << "screen geometry:" << s->geometry();
+            bool screenExisted = !winPtr.isNull();
+            bool screenRecreated = false;
+            if (screenExisted) {
+                // Wayland 下 setScreen 无法重建 layer-shell surface。若 QScreen 已变
+                // （output 重枚举后 Qt 把窗口移到主屏），必须销毁旧窗口重建，
+                // 否则 layer surface 仍绑在旧 output 上。
+                if (d->windowScreenChanged(winPtr, s)) {
+                    fmInfo() << "QScreen changed for screen:" << s->name() << "recreating window";
+                    winPtr->hide();
+                    winPtr.reset();
+                    winPtr = d->createWindow(s);
+                    d->windows.insert(s->name(), winPtr);
+                    screenRecreated = true;
+                } else {
+                    if (winPtr->geometry() != s->geometry())
+                        winPtr->setGeometry(s->geometry());
+                    fmInfo() << "Updated window for screen:" << s->name() << "window geometry:" << winPtr->geometry() << "screen geometry:" << s->geometry();
+                }
             } else {
                 // 添加缺少的数据
                 winPtr = d->createWindow(s);
@@ -245,7 +308,11 @@ void WindowFrame::buildBaseWindow()
 
             d->updateProperty(winPtr, s, (s == primary));
             //! 必须先隐藏，否则后面调用show时无法带动子窗口显示
-            winPtr->hide();
+            if (screenExisted && !screenRecreated) {
+                skippedHide.insert(s->name());
+            } else {
+                winPtr->hide();
+            }
         }
     }
 
@@ -256,9 +323,19 @@ void WindowFrame::buildBaseWindow()
     layoutChildren();
 
     for (auto win : d->windows) {
-        // the root windows must be hide before show
-        Q_ASSERT(win->isVisible() == false);
-        win->show();
+        const QString screenName = d->windows.key(win);
+        if (skippedHide.contains(screenName)) {
+            // Window was not hidden (QScreen unchanged), ensure child
+            // widgets are visible without a hide/show cycle
+            for (QObject *obj : win->children()) {
+                if (QWidget *child = qobject_cast<QWidget*>(obj))
+                    child->show();
+            }
+        } else {
+            // the root windows must be hide before show
+            Q_ASSERT(win->isVisible() == false);
+            win->show();
+        }
     }
 
     emit windowShowed();

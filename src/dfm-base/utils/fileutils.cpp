@@ -8,6 +8,7 @@
 #include <dfm-base/utils/sysinfoutils.h>
 #include <dfm-base/utils/systempathutil.h>
 #include <dfm-base/utils/protocolutils.h>
+#include <dfm-base/utils/threadcontainer.h>
 #include <dfm-base/dfm_global_defines.h>
 #include <dfm-base/utils/dialogmanager.h>
 #include <dfm-base/base/urlroute.h>
@@ -242,11 +243,18 @@ bool FileUtils::isContainProhibitPath(const QList<QUrl> &urls)
 
 bool FileUtils::isDesktopFile(const QUrl &url)
 {
-    // At present, there is no dfmio library code. For temporary repair, use the method on v20 to obtain mimeType
-    auto info = InfoFactory::create<FileInfo>(url);
-    if (!info)
+    if (ProtocolUtils::isRemoteFile(url))
         return false;
-    return isDesktopFileInfo(info);
+
+    if (isDesktopFileSuffix(url))
+        return QFileInfo(url.toLocalFile()).isFile();
+
+    const QString &target = symlinkTarget(url);
+    if (!target.isEmpty()
+        && target.endsWith(QString(".") + DFMBASE_NAMESPACE::Global::Scheme::kDesktop, Qt::CaseInsensitive))
+        return true;
+
+    return false;
 }
 
 bool FileUtils::isDesktopFileSuffix(const QUrl &url)
@@ -255,24 +263,23 @@ bool FileUtils::isDesktopFileSuffix(const QUrl &url)
     // but there are interfaces that call "isDesktopFile"
     // so often that it would be a performance loss to
     // create a fileinfo
-    return url.toString().endsWith(".desktop");
+    if (!url.toString().endsWith(".desktop"))
+        return false;
+    return !ProtocolUtils::isRemoteFile(url);
 }
 
 bool FileUtils::isDesktopFileInfo(const FileInfoPointer &info)
 {
     Q_ASSERT(info);
     const QString &suffix = info->nameOf(NameInfoType::kSuffix);
-    if (suffix == DFMBASE_NAMESPACE::Global::Scheme::kDesktop
-        || info->urlOf(UrlInfoType::kParentUrl).path() == StandardPaths::location(StandardPaths::StandardLocation::kDesktopPath)
-        || info->extendAttributes(ExtInfoType::kFileLocalDevice).toBool()) {
-        const QUrl &url = info->urlOf(UrlInfoType::kUrl);
-        QMimeType type = info->fileMimeType();
-        if (!type.isValid())
-            type = DMimeDatabase().mimeTypeForFile(url.path(), QMimeDatabase::MatchDefault, QString());
+    if (suffix == DFMBASE_NAMESPACE::Global::Scheme::kDesktop)
+        return !info->isAttributes(OptInfoType::kIsDir);
 
-        // QMimeType::suffixes is not the same as fileinfo's `kSuffix`.
-        if (type.name() == "application/x-desktop"
-            && type.suffixes().contains(DFMBASE_NAMESPACE::Global::Scheme::kDesktop, Qt::CaseInsensitive))
+    if ((info->urlOf(UrlInfoType::kParentUrl).path() == StandardPaths::location(StandardPaths::StandardLocation::kDesktopPath)
+         || info->extendAttributes(ExtInfoType::kFileLocalDevice).toBool())
+        && info->isAttributes(OptInfoType::kIsSymLink)) {
+        const QString &target = info->pathOf(PathInfoType::kSymLinkTarget);
+        if (target.endsWith(QString(".") + DFMBASE_NAMESPACE::Global::Scheme::kDesktop, Qt::CaseInsensitive))
             return true;
     }
 
@@ -332,7 +339,7 @@ bool FileUtils::isSameDevice(const QUrl &url1, const QUrl &url2)
         return DFMIO::DFMUtils::devicePathFromUrl(url1) == DFMIO::DFMUtils::devicePathFromUrl(url2);
     }
 
-    return url1.host() == url2.host() && url1.port() == url1.port();
+    return url1.host() == url2.host() && url1.port() == url2.port();
 }
 
 bool FileUtils::isSameFile(const QUrl &url1, const QUrl &url2, const Global::CreateFileInfoType infoCache)
@@ -1230,9 +1237,13 @@ QUrl FileUtils::bindUrlTransform(const QUrl &url)
         return tmp;
     }
 
-    auto path = FileUtils::trashPathToNormal(url.path());
-    path = FileUtils::bindPathTransform(path, false);
-    path = FileUtils::normalPathToTrash(path);
+    auto normalPath = FileUtils::trashPathToNormal(url.path());
+    auto transformedPath = FileUtils::bindPathTransform(normalPath, false);
+
+    if (transformedPath == normalPath)
+        return url;
+
+    auto path = FileUtils::normalPathToTrash(transformedPath);
     tmp.setPath(path);
     return tmp;
 }
@@ -1250,6 +1261,8 @@ QString FileUtils::trashPathToNormal(const QString &trash)
 QString FileUtils::normalPathToTrash(const QString &normal)
 {
     QString trash = normal;
+    while (trash.startsWith("/"))
+        trash = trash.mid(1);
     trash = trash.replace("/", "\\");
     trash.push_front("/");
     return trash;
@@ -1403,6 +1416,25 @@ QString FileUtils::findIconFromXdg(const QString &iconName)
         qCWarning(logDFMBase) << "qtxdg-iconfinder not found";
         return QString();
     }
+}
+
+bool FileUtils::isDefaultHiddenFile(const QUrl &fileUrl)
+{
+    static DThreadList<QUrl> defaultHiddenUrls;
+    static std::once_flag flg;
+    std::call_once(flg, [&] {
+        using namespace GlobalServerDefines;
+        const auto &systemBlks = DevProxyMng->getAllBlockIds(DeviceQueryOption::kSystem | DeviceQueryOption::kMounted);
+        for (const auto &blk : systemBlks) {
+            auto blkInfo = DevProxyMng->queryBlockInfo(blk);
+            const QStringList &mountPoints = blkInfo.value(DeviceProperty::kMountPoints).toStringList();
+            for (const auto &mpt : mountPoints) {
+                defaultHiddenUrls.push_backByLock(QUrl::fromLocalFile(mpt + (mpt == "/" ? "root" : "/root")));
+                defaultHiddenUrls.push_backByLock(QUrl::fromLocalFile(mpt + (mpt == "/" ? "lost+found" : "/lost+found")));
+            }
+        }
+    });
+    return defaultHiddenUrls.containsByLock(fileUrl);
 }
 
 }

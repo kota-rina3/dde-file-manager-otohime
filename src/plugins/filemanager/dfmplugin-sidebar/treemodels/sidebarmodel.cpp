@@ -4,16 +4,26 @@
 
 #include "sidebarmodel.h"
 #include "treeviews/sidebaritem.h"
+#include "treeviews/sidebarwidget.h"
 #include "utils/sidebarhelper.h"
+#include "utils/sidebarfilewatcher.h"
+#include "utils/sidebarinfocachemananger.h"
 
+#include <dfm-base/base/schemefactory.h>
+#include <dfm-base/base/application/application.h>
 #include <dfm-base/utils/universalutils.h>
+#include <dfm-base/utils/filenamesorter.h>
+#include <dfm-base/utils/fileutils.h>
 #include <dfm-framework/event/event.h>
 
 #include <QMimeData>
 #include <QDebug>
 #include <QtConcurrent>
+#include <QStack>
+#include <QTreeView>
 
 DPSIDEBAR_USE_NAMESPACE
+DFMBASE_USE_NAMESPACE
 
 /*!
  * \class SideBarModel
@@ -22,6 +32,10 @@ DPSIDEBAR_USE_NAMESPACE
 SideBarModel::SideBarModel(QObject *parent)
     : QStandardItemModel(parent)
 {
+    fileWatcher = new SidebarFileWatcher(this);
+    connect(fileWatcher, &SidebarFileWatcher::directoryCreated, this, &SideBarModel::onDirectoryCreated);
+    connect(fileWatcher, &SidebarFileWatcher::directoryRemoved, this, &SideBarModel::onDirectoryRemoved);
+    connect(fileWatcher, &SidebarFileWatcher::directoryRenamed, this, &SideBarModel::onDirectoryRenamed);
 }
 
 bool SideBarModel::canDropMimeData(const QMimeData *data, Qt::DropAction action, int row, int column, const QModelIndex &parent) const
@@ -382,6 +396,51 @@ QModelIndex SideBarModel::findRowByUrl(const QUrl &url) const
     return retIndex;
 }
 
+QModelIndex SideBarModel::findGroupIndex(const QString &name) const
+{
+    for (int i = 0; i < rowCount(); ++i) {
+        auto item = itemFromIndex(i);
+        SideBarItemSeparator *groupItem = dynamic_cast<SideBarItemSeparator *>(item);
+        if (groupItem && groupItem->group() == name)
+            return index(i, 0);
+    }
+    fmWarning() << "Group not found in sidebar!" << name;
+    return {};
+}
+
+QModelIndexList SideBarModel::findRowsByUrlRecursive(const QUrl &url, const QModelIndex &parent) const
+{
+    QModelIndexList ret;
+    QStack<QModelIndex> stack;
+    stack.push(parent);
+
+    while (!stack.isEmpty()) {
+        auto current = stack.pop();
+        for (int i = 0; i < rowCount(current); ++i) {
+            auto idx = index(i, 0, current);
+            if (!idx.isValid())
+                continue;
+
+            auto item = itemFromIndex(idx);
+            if (!item)
+                continue;
+
+            if (UniversalUtils::urlEquals(url, item->url())
+                || UniversalUtils::urlEquals(url, item->targetUrl())
+                || (item->itemInfo().findMeCb && item->itemInfo().findMeCb(item->url(), url))) {
+                ret << idx;
+                continue;
+            }
+
+            if (UniversalUtils::isParentUrl(url, item->url())
+                || UniversalUtils::isParentUrl(url, item->targetUrl())) {
+                stack.push(idx);
+            }
+        }
+    }
+    return ret;
+}
+
 void SideBarModel::addEmptyItem()
 {
     // Attention!
@@ -403,4 +462,263 @@ void SideBarModel::addEmptyItem()
 
     QStandardItemModel::appendRow(emptyItem);
     endInsertRows();
+}
+
+void SideBarModel::onItemExpanded(const QModelIndex &index)
+{
+    SideBarItem *item = itemFromIndex(index);
+    if (!item)
+        return;
+
+    QUrl url = item->targetUrl();
+    if (url.isEmpty())
+        url = item->url();
+
+    m_urlIndexMap.insert(url, QPersistentModelIndex(index));
+
+    if (fileWatcher)
+        fileWatcher->watchDirectory(url);
+}
+
+void SideBarModel::onItemCollapsed(const QModelIndex &index)
+{
+    SideBarItem *item = itemFromIndex(index);
+    if (!item)
+        return;
+
+    QUrl url = item->targetUrl();
+    if (url.isEmpty())
+        url = item->url();
+
+    // Before unwatching, make sure no other sidebar view still has this url expanded.
+    auto isExpandedInAnyView = [](const QModelIndex &idx) {
+        if (!idx.isValid())
+            return false;
+
+        auto sbs = SideBarHelper::allSideBar();
+        return std::any_of(sbs.cbegin(), sbs.cend(), [idx](SideBarWidget *w) {
+            auto v = qobject_cast<QTreeView *>(w->view());
+            return v && v->isExpanded(idx);
+        });
+    };
+    auto partGrp = findGroupIndex(DefaultGroup::kDevice);
+    if (!partGrp.isValid())
+        return;
+    auto idxes = findRowsByUrlRecursive(url, partGrp);
+    bool needWatching = std::any_of(idxes.cbegin(), idxes.cend(), isExpandedInAnyView);
+
+    if (!needWatching)
+        m_urlIndexMap.remove(url);
+
+    if (fileWatcher && !needWatching) {
+        fmDebug() << url << "in sidebar no need to be watched anymore.";
+        fileWatcher->unwatchDirectory(url);
+    }
+}
+
+void SideBarModel::addSubItems(const QModelIndex &index, const QList<QUrl> &urls)
+{
+    SideBarItem *parentItem = itemFromIndex(index);
+    if (!parentItem) {
+        fmWarning() << "cannot find parent sidebar item!" << index;
+        return;
+    }
+
+    QSet<QUrl> urlSet(urls.begin(), urls.end());
+
+    QSet<QUrl> existingSet;
+    for (int i = 0; i < parentItem->rowCount(); ++i) {
+        SideBarItem *child = static_cast<SideBarItem *>(parentItem->child(i));
+        if (child)
+            existingSet.insert(child->url());
+    }
+
+    for (int i = parentItem->rowCount() - 1; i >= 0; --i) {
+        SideBarItem *child = static_cast<SideBarItem *>(parentItem->child(i));
+        if (child && !urlSet.contains(child->url())) {
+            SideBarInfoCacheMananger::instance()->removeItemInfoCache(child->url());
+            parentItem->removeRow(i);
+        }
+    }
+
+    // Preserve the order of the incoming list (already sorted by
+    // TraversalDirThread via FileNameSorter) rather than iterating over a
+    // QSet (which discards order). addSubItem inserts each new item at the
+    // correct position relative to existing children; since the incoming list
+    // is already sorted, the linear scan in addSubItem hits the best case
+    // (append at end) for each item, giving overall O(n) on the batch path.
+    for (const QUrl &url : urls) {
+        if (!existingSet.contains(url))
+            addSubItem(index, url);
+    }
+}
+
+void SideBarModel::onDirectoryCreated(const QUrl &parentUrl, const QUrl &url)
+{
+    auto it = m_urlIndexMap.find(parentUrl);
+    if (it != m_urlIndexMap.end() && it->isValid()) {
+        addSubItem(*it, url);
+        return;
+    }
+    auto partGrp = findGroupIndex(DefaultGroup::kDevice);
+    auto idxes = findRowsByUrlRecursive(parentUrl, partGrp);
+    for (auto idx : idxes)
+        addSubItem(idx, url);
+}
+
+void SideBarModel::onDirectoryRemoved(const QUrl &parentUrl, const QUrl &url)
+{
+    auto it = m_urlIndexMap.find(url);
+    if (it != m_urlIndexMap.end() && it->isValid()) {
+        removeSubItem(*it, url);
+        return;
+    }
+    auto partGrp = findGroupIndex(DefaultGroup::kDevice);
+    auto idxes = findRowsByUrlRecursive(url, partGrp);
+    for (auto idx : idxes)
+        removeSubItem(idx, url);
+}
+
+void SideBarModel::onDirectoryRenamed(const QUrl &parentUrl, const QUrl &oldUrl, const QUrl &newUrl)
+{
+    onDirectoryRemoved(parentUrl, oldUrl);
+    onDirectoryCreated(parentUrl, newUrl);
+}
+
+void SideBarModel::addSubItem(const QModelIndex &index, const QUrl &url)
+{
+    auto info = InfoFactory::create<FileInfo>(url, dfmbase::Global::kCreateFileInfoSync);
+    if (!info) {
+        fmWarning() << "Failed to create FileInfo instance!" << url;
+        return;
+    }
+
+    if (info->isAttributes(FileInfo::FileIsType::kIsHidden)
+        && !Application::instance()->genericAttribute(dfmbase::Application::kShowedHiddenFiles).toBool()) {
+        fmInfo() << "Hidden file created and not hidden files should not be displayed" << url;
+        return;
+    }
+
+    // Hide system-default hidden directories (e.g. /<mount-point>/root, /<mount-point>/lost+found)
+    // to keep the sidebar sub-tree consistent with the file view, which filters them via
+    // FileSortWorker::isDefaultHiddenFile.
+    if (!Application::instance()->genericAttribute(dfmbase::Application::kShowedHiddenFiles).toBool()
+        && FileUtils::isDefaultHiddenFile(url)) {
+        fmInfo() << "Default hidden directory should not be displayed in sidebar" << url;
+        return;
+    }
+
+    SideBarItem *parentItem = itemFromIndex(index);
+    if (!parentItem) {
+        fmDebug() << "Failed to get parent item from index";
+        return;
+    }
+
+    // Skip if the child already exists.
+    int childCount = parentItem->rowCount();
+    for (int i = 0; i < childCount; ++i) {
+        SideBarItem *childItem = dynamic_cast<SideBarItem *>(parentItem->child(i));
+        if (childItem && DFMBASE_NAMESPACE::UniversalUtils::urlEquals(url, childItem->url()))
+            return;
+    }
+
+    QString group = parentItem->group();
+    // Use the file-view display name (translated via SystemPathUtil) so XDG directories
+    // (Desktop/Documents/...) and /home/<user> show localized names (桌面/文档/主目录) in the
+    // sidebar tree, consistent with the workspace file view.
+    QString fileName = info ? info->displayOf(DisPlayInfoType::kFileDisplayName) : "Unknown";
+    if (fileName.isEmpty())
+        fileName = info ? info->fileName() : "Unknown";
+    QIcon folderIcon = QIcon::fromTheme("folder");
+
+    SideBarItem *item = new SideBarItem(folderIcon, fileName, group, url);
+    if (!item) {
+        fmDebug() << "Failed to create new sidebar item";
+        return;
+    }
+
+    ItemInfo itemInfo = ItemInfo(url, { { PropertyKey::kItemExpandable, true },
+                                        { PropertyKey::kFinalUrl, url },
+                                        { PropertyKey::kGroup, DefaultGroup::kDevice },
+                                        { PropertyKey::kDisplayName, fileName } });
+    SideBarInfoCacheMananger::instance()->addItemInfoCache(itemInfo);
+
+    item->setExpandable(true);
+
+    // Sub-items are not editable and not draggable.
+    Qt::ItemFlags flags = item->flags();
+    flags &= ~Qt::ItemIsEditable;
+    flags &= ~Qt::ItemIsDragEnabled;
+    item->setFlags(flags);
+
+    // Insert in sorted order using the global FileNameSorter (numeric-aware ICU
+    // collation) so that the sidebar sub-tree ordering matches the file view,
+    // title bar crumb completion, and desktop canvas.
+    QString newName = fileName;
+    int insertRow = childCount;
+    for (int i = 0; i < childCount; ++i) {
+        SideBarItem *childItem = dynamic_cast<SideBarItem *>(parentItem->child(i));
+        if (childItem) {
+            QString childName = childItem->text();
+            if (dfmbase::FileNameSorter::compare(newName, childName, Qt::AscendingOrder)) {
+                insertRow = i;
+                break;
+            }
+        }
+    }
+
+    parentItem->insertRow(insertRow, item);
+}
+
+void SideBarModel::removeSubItem(const QModelIndex &index, const QUrl &url)
+{
+    if (!index.isValid()) {
+        fmDebug() << "Directory not found in sidebar:" << url;
+        return;
+    }
+
+    QModelIndex parentIndex = index.parent();
+    if (!parentIndex.isValid()) {
+        fmDebug() << "Parent index is invalid";
+        return;
+    }
+
+    QStandardItem *parentItem = itemFromIndex(parentIndex);
+    if (!parentItem) {
+        fmDebug() << "Failed to get parent item from index";
+        return;
+    }
+
+    SideBarItem *itemToRemove = itemFromIndex(index);
+    if (!itemToRemove) {
+        fmDebug() << "Failed to get item from index";
+        return;
+    }
+
+    SideBarItemSeparator *separatorItem = dynamic_cast<SideBarItemSeparator *>(parentItem);
+    if (separatorItem) {
+        // Parent is a separator (group), so only remove children of the current item.
+        fmDebug() << "Parent item is a separator, removing all children of:" << url;
+
+        int childCount = itemToRemove->rowCount();
+        if (childCount > 0) {
+            beginRemoveRows(index, 0, childCount - 1);
+            for (int i = childCount - 1; i >= 0; --i) {
+                if (auto *child = static_cast<SideBarItem *>(itemToRemove->child(i)))
+                    SideBarInfoCacheMananger::instance()->removeItemInfoCache(child->url());
+                itemToRemove->removeRow(i);
+            }
+            endRemoveRows();
+            fmDebug() << "Removed" << childCount << "children from:" << url;
+        }
+
+        emit requestCollapseItem(index);
+        fmDebug() << "Requested to collapse item after removed children:" << url;
+    } else {
+        // Parent is a regular item, remove the item itself.
+        fmDebug() << "Removing item:" << url;
+        SideBarInfoCacheMananger::instance()->removeItemInfoCache(url);
+        parentItem->removeRow(index.row());
+        fmDebug() << "Item removed from sidebar:" << url;
+    }
 }

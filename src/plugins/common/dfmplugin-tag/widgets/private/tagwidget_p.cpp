@@ -35,25 +35,32 @@ TagWidgetPrivate::~TagWidgetPrivate()
 
 void TagWidgetPrivate::initializeUI()
 {
+    q->setObjectName("DetailTagWidget");
+    q->setAccessibleName("DetailTagWidget");
+
     mainLayout = new QVBoxLayout(q);
     q->setLayout(mainLayout);
     QString name = tr("Tag");
     tagLable = new DLabel(name, q);
+    tagLable->setAccessibleName("TagLable");
     DFontSizeManager::instance()->bind(tagLable, DFontSizeManager::SizeType::T6, QFont::DemiBold);
     tagLable->setObjectName(name);
     tagLeftLable = new DLabel(name, q);
+    tagLeftLable->setAccessibleName("TagLeftLable");
     tagLeftLable->setObjectName(name);
     tagLeftLable->setHidden(true);
 
     colorListWidget = new TagColorListWidget(q, TagColorListWidget::kProperty);
     colorListWidget->setMaximumHeight(30);
     colorListWidget->setObjectName("tagActionWidget");
+    colorListWidget->setAccessibleName("DetailTagColorListWidget");
     colorListWidget->setToolTipVisible(false);
 
     colorListWidget->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
 
     crumbEdit = new TagCrumbEdit(q);
     crumbEdit->setObjectName("tagCrumbEdit");
+    crumbEdit->setAccessibleName("DetailTagCrumbEdit");
     crumbEdit->setFrameShape(QFrame::Shape::NoFrame);
     crumbEdit->viewport()->setBackgroundRole(QPalette::NoRole);
     crumbEdit->setFocusPolicy(Qt::ClickFocus);

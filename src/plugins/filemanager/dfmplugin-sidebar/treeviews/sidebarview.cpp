@@ -8,14 +8,20 @@
 #include "sidebaritem.h"
 #include "utils/fileoperatorhelper.h"
 #include "utils/sidebarhelper.h"
+#include "utils/sidebarinfocachemananger.h"
+#include "utils/devicemountsubscriber.h"
 #include "private/sidebarview_p.h"
+#include "events/sidebareventcaller.h"
 
 #include <dfm-base/widgets/filemanagerwindowsmanager.h>
 #include <dfm-base/base/urlroute.h>
 #include <dfm-base/base/schemefactory.h>
+#include <dfm-base/base/application/application.h>
+#include <dfm-base/base/configs/dconfig/dconfigmanager.h>
 #include <dfm-base/utils/fileutils.h>
 #include <dfm-base/utils/universalutils.h>
 #include <dfm-base/utils/sysinfoutils.h>
+#include <dfm-base/utils/traversaldirthread.h>
 
 #include <dfm-framework/dpf.h>
 
@@ -24,6 +30,7 @@
 #include <QCursor>
 #include <QMimeData>
 #include <QApplication>
+#include <memory>
 #include <QMouseEvent>
 #include <QUrl>
 #include <QProxyStyle>
@@ -31,9 +38,13 @@
 #include <DGuiApplicationHelper>
 #include <QStyledItemDelegate>
 #include <QDrag>
+#include <QPainter>
 #include <QTextLayout>
 #include <QScrollBar>
 #include <QScroller>
+#include <QVariantAnimation>
+#include <QPointer>
+#include <QDir>
 
 #include <unistd.h>
 
@@ -70,12 +81,92 @@ void SideBarViewPrivate::onItemDoubleClicked(const QModelIndex &index)
         return;
     }
     SideBarItem *item = q->model()->itemFromIndex(index);
-    if (!dynamic_cast<SideBarItemSeparator *>(item)) {
-        fmDebug() << "Double clicked on non-separator item, ignoring";
+
+    // Handle group separator expand/collapse.
+    if (dynamic_cast<SideBarItemSeparator *>(item)) {
+        q->onChangeExpandState(index, !q->isExpanded(index));
         return;
     }
 
-    q->onChangeExpandState(index, !q->isExpanded(index));
+    // Handle partition sub-directory expand/collapse.
+    if (item && item->group() == DefaultGroup::kDevice) {
+        if (!SideBarHelper::partitionExpandable()) {
+            fmDebug() << "Partition expansion is disabled";
+            return;
+        }
+
+        QUrl finalUrl = item->itemInfo().finalUrl;
+        QUrl nodeUrl = item->url();
+        if (nodeUrl.scheme() == "file")
+            finalUrl = nodeUrl;
+
+        bool deviceMounted = !finalUrl.isEmpty() && finalUrl.isValid();
+
+        fmDebug() << "is mounted?" << deviceMounted << finalUrl;
+        if (deviceMounted) {
+            // Prevent a white-background flash during expansion by setting the
+            // transparent palette before the async expand path runs.  Qt's
+            // QAbstractItemView::mouseDoubleClickEvent may force a viewport
+            // repaint (executePostedLayout) after the doubleClicked signal
+            // is emitted; without the transparent palette that repaint shows
+            // a white flicker.  onChangeExpandState (called later in the
+            // async callback) also sets the transient palette and restores it.
+            setTransparentPalette();
+            expandPartitionItem(index, finalUrl);
+        } else {
+            // Device not yet mounted; subscribe to mount event and auto-expand later.
+            // Cancel any previous subscription for the same device to avoid duplicate toggling.
+            cancelPendingMountSubscription(nodeUrl);
+
+            fmDebug() << "SideBarViewPrivate: Device not mounted, subscribing to mount events:" << nodeUrl;
+
+            QModelIndex capturedIndex = index;
+            QPointer<SideBarView> view = q;
+            QPointer<SideBarViewPrivate> guard(this);
+            QUrl deviceUrl = nodeUrl;
+            const QPersistentModelIndex persistentCapturedIndex(capturedIndex);
+
+            int subId = DeviceMountSubscriber::instance()->subscribe(
+                    nodeUrl,
+                    [persistentCapturedIndex, view, guard, deviceUrl](const QUrl &mountedUrl) {
+                        if (!view || !guard) {
+                            fmDebug() << "SideBarViewPrivate: View destroyed before mount completed";
+                            return;
+                        }
+
+                        guard->pendingMountSubs.remove(deviceUrl);
+
+                        fmDebug() << "SideBarViewPrivate: Device mounted at" << mountedUrl
+                                  << ", auto-expanding directory";
+
+                        QTimer::singleShot(100, view, [persistentCapturedIndex, mountedUrl, view, guard]() {
+                            if (!view || !guard) {
+                                fmDebug() << "SideBarViewPrivate: View destroyed during delayed expansion";
+                                return;
+                            }
+
+                            if (!persistentCapturedIndex.isValid()
+                                || persistentCapturedIndex.model() != view->model()) {
+                                fmDebug() << "SideBarViewPrivate: Stale index after mount, aborting auto-expand";
+                                return;
+                            }
+
+                            if (mountedUrl.isValid() && mountedUrl.scheme() == "file"
+                                && QDir(mountedUrl.path()).exists()) {
+                                guard->expandPartitionItem(persistentCapturedIndex, mountedUrl);
+                            } else {
+                                fmDebug() << "SideBarViewPrivate: Unable to expand - invalid mounted URL:"
+                                          << mountedUrl;
+                            }
+                        });
+                    });
+            if (subId >= 0)
+                pendingMountSubs.insert(nodeUrl, subId);
+        }
+        return;
+    }
+
+    fmDebug() << "Double clicked on non-separator item, ignoring";
 }
 
 void SideBarViewPrivate::setTransparentPalette()
@@ -90,6 +181,125 @@ void SideBarViewPrivate::restorePalette()
     q->setPalette(originPalette);
 }
 
+void SideBarViewPrivate::expandItem(const QModelIndex &index, const QList<QUrl> &subFolders)
+{
+    if (!index.isValid())
+        return;
+
+    q->model()->addSubItems(index, subFolders);
+    q->onChangeExpandState(index, true);
+    q->setCurrentUrl(sidebarUrl);
+}
+
+void SideBarViewPrivate::expandPartitionItem(const QModelIndex &index, const QUrl &url)
+{
+    // If already expanded, collapse it.
+    if (q->isExpanded(index)) {
+        q->onChangeExpandState(index, false);
+        return;
+    }
+
+    auto filters = QDir::Dirs | QDir::NoDotAndDotDot;
+    if (Application::instance()->genericAttribute(Application::kShowedHiddenFiles).toBool())
+        filters |= QDir::Hidden;
+
+    // Show a wait cursor while traversing large directories (e.g. /proc with
+    // hundreds of pid entries) so the user gets immediate feedback that the
+    // expand is in progress. Restored exactly once when the traversal emits
+    // updateChildren or finishes (whichever fires first).
+    QApplication::setOverrideCursor(QCursor(Qt::WaitCursor));
+
+    TraversalDirThread *t = new TraversalDirThread(url, {}, filters, QDirIterator::FollowSymlinks);
+    // Pre-sort the traversal results on the worker thread using FileNameSorter
+    // (numeric-aware ICU collation) so the sidebar sub-tree ordering matches the
+    // file view / title bar / desktop and the heavy sorting is offloaded from
+    // the UI thread.
+    t->setEnableSort(true);
+    connect(t, &TraversalDirThread::finished, t, &TraversalDirThread::deleteLater);
+    const QPersistentModelIndex persistentIndex(index);
+    // Shared flag ensures restoreOverrideCursor is called exactly once per
+    // setOverrideCursor, regardless of which signal fires first. The cursor is
+    // a global QApplication resource, so restoring it does not depend on the
+    // view being alive.
+    auto cursorRestored = std::make_shared<bool>(false);
+    auto restoreCursorOnce = [cursorRestored]() {
+        if (*cursorRestored)
+            return;
+        *cursorRestored = true;
+        QApplication::restoreOverrideCursor();
+    };
+    connect(t, &TraversalDirThread::updateChildren, this, [=](const QList<QUrl> &subs) {
+        restoreCursorOnce();
+        if (!persistentIndex.isValid() || persistentIndex.model() != q->model()) {
+            fmDebug() << "SideBarViewPrivate: Stale index after traversal, aborting expand";
+            return;
+        }
+        this->expandItem(persistentIndex, subs);
+    });
+    // Ensure the cursor is restored even if the thread finishes without emitting
+    // updateChildren (e.g. empty directory or early cancellation).
+    connect(t, &TraversalDirThread::finished, this, [restoreCursorOnce]() {
+        restoreCursorOnce();
+    });
+    t->start();
+}
+
+void SideBarViewPrivate::cancelPendingMountSubscription(const QUrl &deviceUrl)
+{
+    auto it = pendingMountSubs.find(deviceUrl);
+    if (it != pendingMountSubs.end()) {
+        DeviceMountSubscriber::instance()->unsubscribe(it.value());
+        pendingMountSubs.erase(it);
+    }
+}
+
+void SideBarViewPrivate::onExpandableChanged()
+{
+    if (SideBarHelper::partitionExpandable()) {
+        q->viewport()->update();
+        return;
+    }
+
+    fmDebug() << "Partition expansion is disabled";
+    SideBarModel *sidebarModel = q->model();
+    if (!sidebarModel) {
+        fmDebug() << "SideBarViewPrivate: Model is null, cannot collapse partitions";
+        return;
+    }
+
+    auto groupIndex = sidebarModel->findGroupIndex(DefaultGroup::kDevice);
+    if (!groupIndex.isValid()) {
+        fmDebug() << "SideBarViewPrivate: Group index not found";
+        return;
+    }
+
+    // Use rowCount(groupIndex) — not rowCount() — so we iterate device children, not top-level groups.
+    for (int i = 0; i < sidebarModel->rowCount(groupIndex); ++i) {
+        QModelIndex index = sidebarModel->index(i, 0, groupIndex);
+        if (!index.isValid())
+            continue;
+
+        DStandardItem *item = sidebarModel->itemFromIndex(index);
+        SideBarItem *sidebarItem = dynamic_cast<SideBarItem *>(item);
+
+        if (sidebarItem && sidebarItem->group() == DefaultGroup::kDevice) {
+            // Collapse the partition and remove its sub-items so file watchers are released.
+            if (q->isExpanded(index)) {
+                fmDebug() << "SideBarViewPrivate: Collapsing expanded partition:" << sidebarItem->url();
+                q->onChangeExpandState(index, false);
+            }
+            // Remove dynamically-added sub-items (keep the partition item itself).
+            while (sidebarItem->rowCount() > 0) {
+                if (auto *child = static_cast<SideBarItem *>(sidebarItem->child(0)))
+                    SideBarInfoCacheMananger::instance()->removeItemInfoCache(child->url());
+                sidebarItem->removeRow(0);
+            }
+        }
+    }
+
+    q->viewport()->update();
+}
+
 void SideBarViewPrivate::updateHoverIndex(const QModelIndex &index)
 {
     if (currentHoverIndex == index)
@@ -98,10 +308,12 @@ void SideBarViewPrivate::updateHoverIndex(const QModelIndex &index)
     const QModelIndex previousHoverIndex = currentHoverIndex;
     currentHoverIndex = index;
 
-    if (previousHoverIndex.isValid())
-        q->update(previousHoverIndex);
-    if (currentHoverIndex.isValid())
-        q->update(currentHoverIndex);
+    auto safeUpdate = [this](const QModelIndex &idx) {
+        if (idx.isValid() && idx.model() == q->model())
+            q->update(idx);
+    };
+    safeUpdate(previousHoverIndex);
+    safeUpdate(currentHoverIndex);
 }
 
 void SideBarViewPrivate::clearHoverIndex()
@@ -115,6 +327,15 @@ bool SideBarViewPrivate::isCursorInsideIndex(const QModelIndex &index, const QPo
         return false;
 
     const QRect itemRect = q->visualRect(index);
+
+    // Prefer the event-supplied position (fallbackPos) as it is reliable on
+    // all platforms, including Wayland where QCursor::pos() is unavailable
+    // during drag-and-drop operations.
+    if (itemRect.contains(fallbackPos))
+        return true;
+
+    // Fall back to the global cursor position for non-DnD callers or
+    // platforms where the global lookup is still valid (e.g. X11).
     const QPoint globalPos = QCursor::pos();
     if (QWidget *windowWidget = q->window()) {
         const QPoint windowPos = windowWidget->mapFromGlobal(globalPos);
@@ -127,9 +348,145 @@ bool SideBarViewPrivate::isCursorInsideIndex(const QModelIndex &index, const QPo
         }
     }
 
-    // Fallback for compositor paths where childAt/global lookup is unavailable
-    // but the sidebar viewport still owns the active pointer hover state.
-    return q->viewport()->underMouse() && itemRect.contains(fallbackPos);
+    // Last resort: the sidebar viewport still owns the active pointer hover state.
+    return q->viewport()->underMouse();
+}
+
+void SideBarViewPrivate::setDragSourceIndex(const QModelIndex &index)
+{
+    const QModelIndex validIndex = index.isValid() && index.flags().testFlag(Qt::ItemIsDragEnabled)
+            ? index
+            : QModelIndex();
+    if (dragSourceIndex == validIndex)
+        return;
+
+    dragSourceIndex = validIndex;
+}
+
+void SideBarViewPrivate::clearInternalDragState()
+{
+    if (placeholderAnimation)
+        placeholderAnimation->stop();
+
+    isRenderingDragPreview = false;
+    dragSourceIndex = QModelIndex();
+    previousPlaceholderParent = QModelIndex();
+    placeholderParent = QModelIndex();
+    previousPlaceholderRow = -1;
+    placeholderRow = -1;
+    placeholderAnimationProgress = 1.0;
+    q->viewport()->update();
+}
+
+int SideBarViewPrivate::calculatePlaceholderRow(const QPoint &pos, const QMimeData *data) const
+{
+    if (!dragSourceIndex.isValid() || !data)
+        return -1;
+
+    const QModelIndex hoverIndex = q->indexAt(pos);
+    if (!hoverIndex.isValid() || hoverIndex.parent() != dragSourceIndex.parent())
+        return -1;
+
+    int row = dragSourceIndex.row();
+    if (hoverIndex.row() > dragSourceIndex.row())
+        row = hoverIndex.row() + 1;
+    else if (hoverIndex.row() < dragSourceIndex.row())
+        row = hoverIndex.row();
+
+    auto *sidebarModel = q->model();
+    if (!sidebarModel)
+        return -1;
+
+    if (!sidebarModel->canDropMimeData(data, Qt::MoveAction, row, 0, hoverIndex.parent()))
+        return -1;
+
+    return row;
+}
+
+void SideBarViewPrivate::updatePlaceholderRow(int row, const QModelIndex &parent)
+{
+    if (!dragSourceIndex.isValid() || !parent.isValid() || row < 0) {
+        previousPlaceholderParent = placeholderParent;
+        previousPlaceholderRow = placeholderRow;
+        placeholderParent = QModelIndex();
+        placeholderRow = -1;
+        placeholderAnimationProgress = 1.0;
+        q->viewport()->update();
+        return;
+    }
+
+    if (placeholderParent == parent && placeholderRow == row)
+        return;
+
+    previousPlaceholderParent = placeholderParent;
+    previousPlaceholderRow = placeholderRow;
+    placeholderParent = parent;
+    placeholderRow = row;
+
+    if (!placeholderAnimation) {
+        placeholderAnimation = new QVariantAnimation(this);
+        placeholderAnimation->setDuration(120);
+        placeholderAnimation->setEasingCurve(QEasingCurve::OutCubic);
+        connect(placeholderAnimation, &QVariantAnimation::valueChanged, this, [this](const QVariant &value) {
+            placeholderAnimationProgress = value.toReal();
+            q->viewport()->update();
+        });
+        connect(placeholderAnimation, &QVariantAnimation::finished, this, [this]() {
+            placeholderAnimationProgress = 1.0;
+            q->viewport()->update();
+        });
+    }
+
+    if (previousPlaceholderRow < 0 || previousPlaceholderParent != placeholderParent) {
+        placeholderAnimation->stop();
+        placeholderAnimationProgress = 1.0;
+        q->viewport()->update();
+        return;
+    }
+
+    if (placeholderAnimation->state() == QAbstractAnimation::Running)
+        placeholderAnimation->stop();
+
+    placeholderAnimationProgress = 0.0;
+    placeholderAnimation->setStartValue(0.0);
+    placeholderAnimation->setEndValue(1.0);
+    placeholderAnimation->start();
+}
+
+int SideBarViewPrivate::dragItemOffset(const QModelIndex &index, int rowHeight) const
+{
+    if (!isItemDragged || !dragSourceIndex.isValid() || !index.isValid() || rowHeight <= 0)
+        return 0;
+
+    auto calcOffset = [this, rowHeight, &index](const QPersistentModelIndex &parent, int row) -> int {
+        if (!parent.isValid() || row < 0 || index.parent() != parent || dragSourceIndex.parent() != parent)
+            return 0;
+
+        const int sourceRow = dragSourceIndex.row();
+        const int currentRow = index.row();
+        if (currentRow == sourceRow) {
+            if (sourceRow < row)
+                return (row - sourceRow - 1) * rowHeight;
+            if (sourceRow > row)
+                return (row - sourceRow) * rowHeight;
+            return 0;
+        }
+
+        if (sourceRow < row && currentRow > sourceRow && currentRow < row)
+            return -rowHeight;
+
+        if (sourceRow > row && currentRow >= row && currentRow < sourceRow)
+            return rowHeight;
+
+        return 0;
+    };
+
+    const int startOffset = calcOffset(previousPlaceholderParent, previousPlaceholderRow);
+    const int endOffset = calcOffset(placeholderParent, placeholderRow);
+    if (qFuzzyCompare(placeholderAnimationProgress, 1.0))
+        return endOffset;
+
+    return qRound(startOffset + (endOffset - startOffset) * placeholderAnimationProgress);
 }
 
 void SideBarViewPrivate::notifyOrderChanged()
@@ -254,23 +611,7 @@ SidebarViewStyle::SidebarViewStyle(QStyle *style)
 void SidebarViewStyle::drawPrimitive(PrimitiveElement element, const QStyleOption *option, QPainter *painter, const QWidget *widget) const
 {
     if (element == QStyle::PE_IndicatorItemViewItemDrop && !option->rect.isNull()) {
-        painter->setRenderHint(QPainter::Antialiasing);
-        QStyleOption opt(*option);
-        opt.rect.setLeft(0);
-        if (widget)
-            opt.rect.setRight(widget->width());
-        DPalette pl(DPaletteHelper::instance()->palette(widget));
-        QColor bgColor = pl.color(DPalette::ColorGroup::Active, DPalette::ColorType::ItemBackground);
-        QPalette::ColorGroup colorGroup = QPalette::Normal;
-        bgColor = opt.palette.color(colorGroup, QPalette::Highlight);
-        QPen pen = painter->pen();
-        pen.setColor(bgColor);
-        pen.setWidth(2);
-        painter->setPen(pen);
-
-        QPoint posLeft = opt.rect.topLeft();
-        QPoint posRight = opt.rect.bottomRight();
-        painter->drawRoundedRect(QRect(posLeft + QPoint(10, 0), posRight + QPoint(-10, 0)), 8, 8);
+        // 不绘制拖拽指示线，改为拖动时选项位移动画
         return;
     }
     QProxyStyle::drawPrimitive(element, option, painter, widget);
@@ -287,6 +628,7 @@ SideBarView::SideBarView(QWidget *parent)
     setVerticalScrollBarPolicy(Qt::ScrollBarSlideAnimationOn);
 #endif
     setVerticalScrollMode(ScrollPerPixel);
+    setAnimated(true);
     setIconSize(QSize(16, 16));
     setHeaderHidden(true);
     setMouseTracking(true);   // sp3 feature 35，解除注释以便鼠标在移动时就能触发 mousemoveevent
@@ -305,15 +647,33 @@ SideBarView::SideBarView(QWidget *parent)
 
     connect(this, &DTreeView::clicked, d, &SideBarViewPrivate::currentChanged);
     connect(this, &DTreeView::doubleClicked, d, &SideBarViewPrivate::onItemDoubleClicked);
+    connect(DConfigManager::instance(), &DConfigManager::valueChanged, this, [=](const QString &cfg, const QString &key) {
+        if (cfg == ConfigInfos::kConfName && key == ConfigInfos::kPartitionExpandableKey) {
+            m_partitionExpandableCache.reset();
+            d->onExpandableChanged();
+            updateEditTriggers();
+        }
+    });
 
     d->originPalette = palette();
     d->lastOpTimer.start();
 
-    setStyle(new SidebarViewStyle(style()));
+    setDropIndicatorShown(false);
+    auto *sidebarStyle = new SidebarViewStyle(style());
+    setStyle(sidebarStyle);
+    viewport()->setStyle(sidebarStyle);
+
+    // Apply the initial edit-trigger policy according to the tree-view mode.
+    updateEditTriggers();
 }
 
 SideBarView::~SideBarView()
 {
+    // Cancel any pending device-mount subscriptions to avoid lingering callbacks.
+    for (auto it = d->pendingMountSubs.begin(); it != d->pendingMountSubs.end(); ++it)
+        DeviceMountSubscriber::instance()->unsubscribe(it.value());
+    d->pendingMountSubs.clear();
+
     QScroller::ungrabGesture(viewport());
     setStyle(nullptr);
 }
@@ -330,9 +690,35 @@ void SideBarView::mousePressEvent(QMouseEvent *event)
     if (!d->checkOpTime())
         return;
 
+    d->dragPressPos = event->pos();
+    d->setDragSourceIndex(indexAt(event->pos()));
     d->draggedUrl = urlAt(event->pos());
     auto item = itemAt(event->pos());
     d->draggedGroup = item ? item->group() : "";
+
+    auto index = indexAt(event->pos());
+    if (event->button() == Qt::LeftButton && index.isValid()
+        && item && item->group() == DefaultGroup::kDevice) {
+        if (item->isExpandable() && SideBarHelper::partitionExpandable()) {
+            int layer = 0;
+            auto parentIdx = index;
+            while (parentIdx.parent().isValid()) {
+                parentIdx = parentIdx.parent();
+                layer++;
+            }
+            // see @SideBarItemDelegate::drawExpandIndicator
+            // The indicator is painted at (layer * kExpandIndentPerLayer + kExpandIconOffset).
+            // Expand the hit area by kExpandHitMargin on both sides for easier clicking.
+            int iconLeft = layer * ExpandIndicatorGeometry::kIndentPerLayer + ExpandIndicatorGeometry::kIconOffset;
+            int collapseIconLeft = iconLeft - ExpandIndicatorGeometry::kHitMargin;
+            int collapseIconRight = iconLeft + ExpandIndicatorGeometry::kIconSize + ExpandIndicatorGeometry::kHitMargin;
+            if (event->pos().x() >= collapseIconLeft && event->pos().x() <= collapseIconRight) {
+                d->onItemDoubleClicked(index);
+                d->ignoreNextMouseRelease = true;
+                return;   // do not select the item.
+            }
+        }
+    }
 
     if (event->button() == Qt::RightButton) {
         // fix bug#33502 鼠标挪动到侧边栏底部右键，滚动条滑动，不能定位到选中的栏目上
@@ -360,6 +746,13 @@ void SideBarView::mouseReleaseEvent(QMouseEvent *event)
 
             dpfSignalDispatcher->publish("dfmplugin_sidebar", "signal_ReportLog_Commit", QString("Sidebar"), data);
         }
+    }
+
+    // Prevent selecting an item when the mouse press was consumed by the
+    // expand-indicator click handler (see mousePressEvent).
+    if (d->ignoreNextMouseRelease) {
+        d->ignoreNextMouseRelease = false;
+        return;
     }
 
     DTreeView::mouseReleaseEvent(event);
@@ -392,7 +785,11 @@ void SideBarView::dragEnterEvent(QDragEnterEvent *event)
 
     } else {
         d->urlsForDragEvent.clear();
-        d->isItemDragged = true;
+        if (!d->dragSourceIndex.isValid())
+            d->setDragSourceIndex(currentIndex());
+        d->isItemDragged = d->dragSourceIndex.isValid();
+        if (d->dragSourceIndex.isValid())
+            d->updatePlaceholderRow(d->dragSourceIndex.row(), d->dragSourceIndex.parent());
     }
 
     d->previousRowCount = model()->rowCount();
@@ -414,6 +811,16 @@ void SideBarView::dragMoveEvent(QDragMoveEvent *event)
 
     if (event->source() != this)
         d->updateHoverIndex(hoverIndex);
+    else if (d->dragSourceIndex.isValid()) {
+        const int placeholderRow = d->calculatePlaceholderRow(eventPos, event->mimeData());
+        if (placeholderRow >= 0) {
+            d->updatePlaceholderRow(placeholderRow, hoverIndex.parent());
+            event->setDropAction(Qt::MoveAction);
+            event->accept();
+        } else {
+            d->updatePlaceholderRow(d->dragSourceIndex.row(), d->dragSourceIndex.parent());
+        }
+    }
 
     if (event->source() != this && !d->isCursorInsideIndex(hoverIndex, eventPos)) {
         d->clearHoverIndex();
@@ -433,7 +840,7 @@ void SideBarView::dragMoveEvent(QDragMoveEvent *event)
     if (isAccepteDragEvent(event))
         return;
 
-    DTreeView::dragMoveEvent(event);
+    // DTreeView::dragMoveEvent(event);  // 禁用拖拽指示线
 
     if (event->source() != this)
         event->ignore();
@@ -446,10 +853,12 @@ void SideBarView::dragLeaveEvent(QDragLeaveEvent *event)
     d->isItemDragged = false;
     setState(State::NoState);
     d->clearHoverIndex();
+    d->clearInternalDragState();
 }
 
 void SideBarView::dropEvent(QDropEvent *event)
 {
+    const bool isInternalDrag = event->source() == this;
     const QPoint eventPos = event->position().toPoint();
     const QModelIndex hoverIndex = indexAt(eventPos);
     d->clearHoverIndex();
@@ -457,8 +866,28 @@ void SideBarView::dropEvent(QDropEvent *event)
     if (d->draggedUrl.isValid()) {   // select the dragged item when dropped.
         d->notifyOrderChanged();   // notify to update the persistence data
     }
-
     d->dropPos = eventPos;
+
+    if (isInternalDrag) {
+        // Use calculatePlaceholderRow to ensure the actual drop row matches
+        // the visual placeholder shown during dragMoveEvent. The base class
+        // dropEvent relies on dropIndicatorPosition which is never updated
+        // because dragMoveEvent does not call the base class.
+        const int targetRow = d->calculatePlaceholderRow(eventPos, event->mimeData());
+        if (targetRow >= 0 && d->dragSourceIndex.isValid()) {
+            const QModelIndex parent = d->dragSourceIndex.parent();
+            if (auto *sidebarModel = model()) {
+                if (sidebarModel->dropMimeData(event->mimeData(), Qt::MoveAction,
+                                               targetRow, 0, parent)) {
+                    event->setDropAction(Qt::MoveAction);
+                    event->accept();
+                }
+            }
+        }
+        d->clearInternalDragState();
+        return;
+    }
+
     SideBarItem *item = itemAt(eventPos);
     if (!item)
         return DTreeView::dropEvent(event);
@@ -557,8 +986,78 @@ void SideBarView::startDrag(Qt::DropActions supportedActions)
         }
     }
 
+    QModelIndex sourceIndex = d->dragSourceIndex;
+    if (!sourceIndex.isValid())
+        sourceIndex = currentIndex();
+    if (!sourceIndex.isValid() || !sourceIndex.flags().testFlag(Qt::ItemIsDragEnabled))
+        return;
+    const QPersistentModelIndex sourcePersistentIndex(sourceIndex);
+
+    QMimeData *mimeData = model() ? model()->mimeData({ sourceIndex }) : nullptr;
+    if (!mimeData)
+        return;
+
+    QRect sourceRect = visualRect(sourceIndex);
+    auto *drag = new QDrag(this);
+    drag->setMimeData(mimeData);
+
+    auto *delegate = itemDelegateForIndex(sourceIndex);
+    if (!delegate)
+        delegate = itemDelegate();
+    if (delegate && sourceRect.isValid()) {
+        QStyleOptionViewItem option;
+        initViewItemOption(&option);
+        option.widget = this;
+        option.rect = QRect(QPoint(0, 0), sourceRect.size());
+        option.state |= QStyle::State_Enabled;
+        option.state &= ~(QStyle::State_MouseOver | QStyle::State_Sunken | QStyle::State_HasFocus);
+
+        const qreal dpr = devicePixelRatioF();
+        QPixmap pixmap(option.rect.size() * dpr);
+        pixmap.setDevicePixelRatio(dpr);
+        pixmap.fill(Qt::transparent);
+
+        d->isRenderingDragPreview = true;
+        QPainter painter(&pixmap);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setOpacity(0.9);
+        delegate->paint(&painter, option, sourceIndex);
+        d->isRenderingDragPreview = false;
+
+        drag->setPixmap(pixmap);
+
+        QPoint hotSpot = d->dragPressPos - sourceRect.topLeft();
+        hotSpot.setX(qBound(0, hotSpot.x(), qMax(0, option.rect.width() - 1)));
+        hotSpot.setY(qBound(0, hotSpot.y(), qMax(0, option.rect.height() - 1)));
+        drag->setHotSpot(hotSpot);
+    }
+
     d->isItemDragged = true;
-    DTreeView::startDrag(supportedActions);
+    d->updatePlaceholderRow(sourceIndex.row(), sourceIndex.parent());
+
+    Qt::DropAction defaultAction = defaultDropAction();
+    if (defaultAction == Qt::IgnoreAction || !(supportedActions & defaultAction)) {
+        if (dragDropMode() == QAbstractItemView::InternalMove)
+            defaultAction = Qt::MoveAction;
+        else if (supportedActions & Qt::CopyAction)
+            defaultAction = Qt::CopyAction;
+    }
+
+    const Qt::DropAction resultAction = drag->exec(supportedActions, defaultAction);
+    const QObject *dropTarget = drag->target();
+
+    // QStandardItemModel inserts the moved row on drop, and the default
+    // view implementation removes the original row afterwards. Since we
+    // render a custom drag preview here, we need to perform that cleanup.
+    if (resultAction == Qt::MoveAction
+        && sourcePersistentIndex.isValid()
+        && (dropTarget == this || dropTarget == viewport())) {
+        if (auto *sidebarModel = model())
+            sidebarModel->removeRows(sourcePersistentIndex.row(), 1, sourcePersistentIndex.parent());
+    }
+
+    d->isItemDragged = false;
+    d->clearInternalDragState();
 }
 
 QModelIndex SideBarView::indexAt(const QPoint &p) const
@@ -640,7 +1139,32 @@ void SideBarView::saveStateWhenClose()
 
 void SideBarView::setCurrentUrl(const QUrl &url)
 {
+    // The sidebar highlight is URL-based (see SideBarItemDelegate::paint): an item is
+    // highlighted when its URL matches currentUrl(), and the highlight only refreshes
+    // when the item is repainted. setCurrentIndex() is meant to repaint the newly
+    // current item via currentChanged(), but that repaint is unreliable here:
+    //   - QItemSelectionModel::setCurrentIndex() is a no-op (no currentChanged) when
+    //     Qt's current index already equals the target, e.g. returning to a sidebar
+    //     item visited before, or coming back after navigating into a sub-folder that
+    //     has no sidebar item (which never changes the current index);
+    //   - the collapsed-group early-return and the not-found branch below skip
+    //     setCurrentIndex() entirely.
+    // The sidebar-click path works only because SideBarWidget::onItemActived explicitly
+    // update()s the previous/current items afterwards; the file-view navigation path
+    // (cd() -> setCurrentUrl) has no such repaint, so the highlight does not refresh
+    // until a hover triggers a viewport repaint.
+    //
+    // Fix: whenever the URL basis actually changes, repaint the whole viewport so every
+    // visible item re-evaluates its URL-based highlight against the new url -- the
+    // previously highlighted item drops its stale highlight and the newly matching
+    // item gains it, immediately, without depending on setCurrentIndex(). Duplicate
+    // URL matches are de-duplicated by SideBarItemDelegate via
+    // isCurrentUrlHighlightIndex().
+    const QUrl previousUrl = d->sidebarUrl;
     d->sidebarUrl = url;
+    if (!UniversalUtils::urlEquals(previousUrl, url))
+        viewport()->update();   // refresh URL-based highlight for all visible items immediately
+
     bool urlNotChanged = UniversalUtils::urlEquals(d->current.data(SideBarItem::kItemUrlRole).toUrl(), url);
     const QModelIndex &index = urlNotChanged ? d->current : findItemIndex(url);
 
@@ -666,6 +1190,7 @@ void SideBarView::setCurrentUrl(const QUrl &url)
         // the unexpanded group would be expaned again.
         if (groupItem && !groupItem->isExpanded()) {
             fmDebug() << "Group not expanded, skipping current index set for URL:" << url;
+            d->current = index;
             return;
         }
     }
@@ -680,6 +1205,70 @@ void SideBarView::setCurrentUrl(const QUrl &url)
 QUrl SideBarView::currentUrl() const
 {
     return d->sidebarUrl;
+}
+
+bool SideBarView::isCurrentUrlHighlightIndex(const QModelIndex &index) const
+{
+    if (!index.isValid())
+        return false;
+
+    SideBarModel *sidebarModel = dynamic_cast<SideBarModel *>(model());
+    if (!sidebarModel)
+        return true;
+
+    const auto matchesCurrentUrl = [this, sidebarModel](const QModelIndex &candidate) {
+        if (!candidate.isValid())
+            return false;
+
+        SideBarItem *item = sidebarModel->itemFromIndex(candidate);
+        if (!item)
+            return false;
+
+        return UniversalUtils::urlEquals(item->url(), d->sidebarUrl)
+                || UniversalUtils::urlEquals(item->targetUrl(), d->sidebarUrl)
+                || (item->itemInfo().findMeCb && item->itemInfo().findMeCb(item->url(), d->sidebarUrl));
+    };
+    const auto isVisibleCandidate = [this](const QModelIndex &candidate) {
+        if (isIndexHidden(candidate))
+            return false;
+
+        for (QModelIndex parent = candidate.parent(); parent.isValid(); parent = parent.parent()) {
+            if (isIndexHidden(parent) || !isExpanded(parent))
+                return false;
+        }
+
+        return true;
+    };
+
+    QList<QModelIndex> matches;
+    QList<QModelIndex> pending { QModelIndex() };
+    while (!pending.isEmpty()) {
+        const QModelIndex parent = pending.takeLast();
+        const int childCount = sidebarModel->rowCount(parent);
+        for (int row = 0; row < childCount; ++row) {
+            const QModelIndex candidate = sidebarModel->index(row, 0, parent);
+            if (!candidate.isValid())
+                continue;
+
+            if (matchesCurrentUrl(candidate) && isVisibleCandidate(candidate))
+                matches.append(candidate);
+
+            if (sidebarModel->rowCount(candidate) > 0)
+                pending.append(candidate);
+        }
+    }
+
+    if (matches.size() <= 1)
+        return true;
+
+    if (matches.contains(d->current) && matchesCurrentUrl(d->current))
+        return index == d->current;
+
+    const QModelIndex viewCurrent = currentIndex();
+    if (matches.contains(viewCurrent) && matchesCurrentUrl(viewCurrent))
+        return index == viewCurrent;
+
+    return index == matches.first();
 }
 
 QModelIndex SideBarView::findItemIndex(const QUrl &url) const
@@ -735,6 +1324,41 @@ bool SideBarView::isDropTarget(const QModelIndex &index) const
 bool SideBarView::isSideBarItemDragged() const
 {
     return d->isItemDragged;
+}
+
+bool SideBarView::isDraggedSource(const QModelIndex &index) const
+{
+    return d->dragSourceIndex == index;
+}
+
+bool SideBarView::isRenderingDragPreview() const
+{
+    return d->isRenderingDragPreview;
+}
+
+int SideBarView::dragItemVerticalOffset(const QModelIndex &index, int rowHeight) const
+{
+    return d->dragItemOffset(index, rowHeight);
+}
+
+bool SideBarView::isPartitionExpandable() const
+{
+    if (m_partitionExpandableCache.has_value())
+        return *m_partitionExpandableCache;
+    m_partitionExpandableCache = SideBarHelper::partitionExpandable();
+    return *m_partitionExpandableCache;
+}
+
+void SideBarView::updateEditTriggers()
+{
+    // The sidebar tree view (partitionExpandable) reserves double-click for
+    // expanding/collapsing a partition, so inline renaming on double-click must be
+    // disabled in that mode and restored when the tree view is turned off.
+    // F2 (EditKeyPressed) and the context-menu rename entry are kept in both modes.
+    if (isPartitionExpandable())
+        setEditTriggers(QAbstractItemView::EditKeyPressed);
+    else
+        setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
 }
 
 Qt::DropAction SideBarView::canDropMimeData(SideBarItem *item, const QMimeData *data, Qt::DropActions actions) const
@@ -946,7 +1570,25 @@ void SideBarView::onChangeExpandState(const QModelIndex &index, bool expand)
         if (expand)
             setCurrentUrl(d->sidebarUrl);   // To make sure, when expand the group item, the current item is highlighted.
     }
-    update(index);
+
+    // Notify SideBarModel to start/stop file watching for partition items.
+    if (expand) {
+        sidebarModel->onItemExpanded(index);
+    } else {
+        sidebarModel->onItemCollapsed(index);
+    }
+
+    if (index.isValid() && index.model() == sidebarModel)
+        update(index);
+}
+
+void SideBarView::onRequestCollapseItem(const QModelIndex &index)
+{
+    if (index.isValid() && index.model() == model()) {
+        collapse(index);
+        onChangeExpandState(index, false);
+        fmDebug() << "Collapsed item per model request:" << index.data(Qt::DisplayRole).toString();
+    }
 }
 
 bool SideBarViewPrivate::checkOpTime()

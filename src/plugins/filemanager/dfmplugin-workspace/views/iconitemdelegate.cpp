@@ -616,41 +616,32 @@ QRectF IconItemDelegate::paintItemIcon(QPainter *painter, const QStyleOptionView
 
     // init icon geomerty
     QRectF iconRect = itemIconRect(drawingRect);
+    const auto iconName = index.data(Global::ItemRoles::kItemFileIconNameRole).toString();
 
     bool isDropTarget = parent()->isDropTarget(index);
+    // 拖拽图标绘制,不走缓存
     if (isDropTarget) {
-        QPixmap pixmap = opt.icon.pixmap(iconRect.size().toSize());
+        QPixmap pixmap;
+        pixmap = index.data(Global::ItemRoles::kItemFileIconRole).value<QIcon>()
+                         .pixmap(iconRect.size().toSize());
         QPainter p(&pixmap);
 
         p.setCompositionMode(QPainter::CompositionMode_SourceAtop);
         p.fillRect(QRect(QPoint(0, 0), iconRect.size().toSize()), QColor(0, 0, 0, (static_cast<int>(std::ceil(255 * 0.1)))));
         p.end();
         painter->drawPixmap(iconRect.toRect(), pixmap);
-    } else {
-        bool isEnabled = opt.state & QStyle::State_Enabled;
-        // draw icon
-        auto drawFileIcon = ItemDelegateHelper::paintIcon(painter, opt.icon,
-                                                          { iconRect,
-                                                            Qt::AlignCenter,
-                                                            isEnabled ? QIcon::Normal : QIcon::Disabled,
-                                                            QIcon::Off,
-                                                            ViewMode::kIconMode,
-                                                            isThumnailIconIndex(index) });
-        // If the thumbnail drawing is empty, then redraw the file fileicon
-        if (!drawFileIcon) {
-            const QIcon &fileIcon = index.data(Global::ItemRoles::kItemFileIconRole).value<QIcon>();
-            ItemDelegateHelper::paintIcon(painter, fileIcon,
-                                          { iconRect,
-                                            Qt::AlignCenter,
-                                            isEnabled ? QIcon::Normal : QIcon::Disabled,
-                                            QIcon::Off,
-                                            ViewMode::kIconMode,
-                                            false });
-        }
+        paintEmblems(painter, iconRect, index);
+        return iconRect;
     }
 
-    paintEmblems(painter, iconRect, index);
+    Q_D(const IconItemDelegate);
+    bool isThumbnail = isThumbnailIconIndex(index);
 
+    ItemDelegateHelper::paintIconWithFallback(
+            painter, opt, index, iconRect, isThumbnail,
+            Global::ViewMode::kIconMode, skipThumbnailFrame(index));
+
+    paintEmblems(painter, iconRect, index);
     return iconRect;
 }
 
@@ -734,18 +725,17 @@ void IconItemDelegate::paintItemFileName(QPainter *painter, QRectF iconRect, QPa
             ? (opt.palette.brush(QPalette::Normal, QPalette::Highlight))
             : QBrush(Qt::NoBrush);
     int lineHeight = UniversalUtils::getTextLineHeight(displayName, parent()->parent()->fontMetrics());
-    QScopedPointer<ElideTextLayout> layout(ItemDelegateHelper::createTextLayout(displayName, QTextOption::WrapAtWordBoundaryOrAnywhere,
-                                                                                lineHeight, Qt::AlignCenter, painter));
-    layout->setHighlightEnabled(!isSelected);
-    layout->setHighlightKeywords(effectiveHighlightKeywords(index));
-    layout->setHighlightColor(QColor(ThemeColor::kHighlightPressColor));
+    d->setupElideLayout(d->reusableElideLayout.get(), displayName,
+                        QTextOption::WrapAtWordBoundaryOrAnywhere, lineHeight, Qt::AlignCenter, painter,
+                        !isSelected, effectiveHighlightKeywords(index),
+                        QColor(ThemeColor::kHighlightPressColor));
 
     labelRect.setLeft(labelRect.left() + kIconModeRectRadius);
     labelRect.setWidth(labelRect.width() - kIconModeRectRadius);
     const FileInfoPointer &info = parent()->fileInfo(index);
-    WorkspaceEventSequence::instance()->doIconItemLayoutText(info, layout.data());
+    WorkspaceEventSequence::instance()->doIconItemLayoutText(info, d->reusableElideLayout.get());
     if (!singleSelected && isSelectedOpt) {
-        layout->setAttribute(ElideTextLayout::kBackgroundRadius, kIconModeRectRadius);
+        d->reusableElideLayout->setAttribute(ElideTextLayout::kBackgroundRadius, kIconModeRectRadius);
     }
 
     // If the filename is very long, sizeHint() will set the height of the last item to maximum
@@ -758,7 +748,7 @@ void IconItemDelegate::paintItemFileName(QPainter *painter, QRectF iconRect, QPa
     }
 
     QStringList textList {};
-    layout->layout(labelRect, opt.textElideMode, painter, background, &textList);
+    d->reusableElideLayout->layout(labelRect, opt.textElideMode, painter, background, &textList);
     painter->restore();
 }
 

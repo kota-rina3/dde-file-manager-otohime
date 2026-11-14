@@ -46,6 +46,8 @@ void ViewHintWidget::initLayout()
     // 原因: 基类的 changeEvent() 会访问内部 d-pointer，复用其控件会导致悬空指针崩溃。
 
     m_iconButton = new DIconButton(this);
+    m_iconButton->setObjectName("IconButton");
+    m_iconButton->setAccessibleName("IconButton");
     m_iconButton->setFlat(true);
     m_iconButton->setFocusPolicy(Qt::NoFocus);
     m_iconButton->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -57,6 +59,8 @@ void ViewHintWidget::initLayout()
     m_messageLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 
     m_closeButton = new DIconButton(this);
+    m_closeButton->setObjectName("CloseButton");
+    m_closeButton->setAccessibleName("CloseButton");
     m_closeButton->setFlat(true);
     m_closeButton->setFocusPolicy(Qt::NoFocus);
     m_closeButton->setIcon(DDciIcon::fromTheme("dfm-clear"));
@@ -82,26 +86,41 @@ void ViewHintWidget::initLayout()
     });
 }
 
-void ViewHintWidget::setCustomWidget(QWidget *widget)
+void ViewHintWidget::setCustomWidget(QWidget *widget, Side side)
 {
-    if (m_customWidget) {
-        m_layout->removeWidget(m_customWidget);
-        m_customWidget->deleteLater();
+    auto &slot = (side == Side::Left) ? m_leftCustomWidget : m_rightCustomWidget;
+
+    if (slot) {
+        m_layout->removeWidget(slot);
+        slot->deleteLater();
     }
 
-    m_customWidget = widget;
+    if (side == Side::Right && m_rightSpacer) {
+        m_layout->removeItem(m_rightSpacer);
+        delete m_rightSpacer;
+        m_rightSpacer = nullptr;
+    }
 
-    if (widget) {
-        // 在 message 和 close 之间插入，需额外 30px spacer 补足 40px 间距（基础 spacing 为 10px）
+    slot = widget;
+
+    if (!widget)
+        return;
+
+    if (side == Side::Left) {
+        m_layout->insertWidget(0, widget);
+        widget->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    } else {
         int insertIdx = 2;
-        m_layout->insertSpacing(insertIdx, kCustomWidgetGap - kItemSpacing);
+        m_rightSpacer = new QSpacerItem(kCustomWidgetGap - kItemSpacing, 0,
+                                        QSizePolicy::Fixed, QSizePolicy::Minimum);
+        m_layout->insertItem(insertIdx, m_rightSpacer);
         m_layout->insertWidget(insertIdx + 1, widget);
     }
 }
 
-QWidget *ViewHintWidget::customWidget() const
+QWidget *ViewHintWidget::customWidget(Side side) const
 {
-    return m_customWidget;
+    return (side == Side::Left) ? m_leftCustomWidget : m_rightCustomWidget;
 }
 
 void ViewHintWidget::setIcon(const QString &icon)
@@ -109,6 +128,12 @@ void ViewHintWidget::setIcon(const QString &icon)
     if (!m_iconButton)
         return;
 
+    if (icon.isEmpty()) {
+        m_iconButton->hide();
+        return;
+    }
+
+    m_iconButton->show();
     auto dciIcon = DDciIcon::fromTheme(icon);
     if (!dciIcon.isNull())
         m_iconButton->setIcon(dciIcon);

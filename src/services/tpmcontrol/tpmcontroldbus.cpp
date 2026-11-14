@@ -11,6 +11,7 @@
 #include <QDataStream>
 #include <QIODevice>
 
+#include <fcntl.h>
 #include <unistd.h>
 #include <cerrno>
 
@@ -22,13 +23,26 @@ SERVICETPMCONTROL_USE_NAMESPACE
 
 using ServiceCommon::PolicyKitHelper;
 
+namespace {
+bool setFallbackFd(QDBusUnixFileDescriptor *fd)
+{
+    int fallbackFd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (fallbackFd < 0) {
+        fmCritical() << "Failed to create fallback D-Bus fd, errno:" << errno;
+        return false;
+    }
+
+    *fd = QDBusUnixFileDescriptor(fallbackFd);
+    ::close(fallbackFd);
+    return fd->isValid();
+}
+}
+
 TPMControlDBus::TPMControlDBus(const char *name, QObject *parent)
     : QObject(parent), QDBusContext(), m_tpmWork(new TPMWork(this))
 {
     QDBusConnection::RegisterOptions opts =
-            QDBusConnection::ExportAllSlots |
-            QDBusConnection::ExportAllSignals |
-            QDBusConnection::ExportAllProperties;
+            QDBusConnection::ExportAllSlots | QDBusConnection::ExportAllSignals | QDBusConnection::ExportAllProperties;
 
     QDBusConnection conn = QDBusConnection::connectToBus(QDBusConnection::SystemBus, QString(name));
     if (!conn.isConnected()) {
@@ -124,7 +138,7 @@ bool TPMControlDBus::sendDataViaFd(const QByteArray &data, QDBusUnixFileDescript
 
     // Write data to pipe
     ssize_t written = write(pipefd[1], data.constData(), data.size());
-    close(pipefd[1]);  // Close write end immediately
+    close(pipefd[1]);   // Close write end immediately
 
     if (written != data.size()) {
         fmCritical() << "Failed to write data to pipe, written:" << written << "expected:" << data.size();
@@ -152,7 +166,7 @@ int TPMControlDBus::IsTPMAvailable()
 {
     fmInfo() << "IsTPMAvailable called";
 
-    if (!checkAuthentication(PolicyKitActionId::kQuery)) {
+    if (!checkAuthentication(PolicyKitActionId::kAccess)) {
         return kAuthFailed;
     }
 
@@ -163,7 +177,7 @@ int TPMControlDBus::CheckTPMLockout()
 {
     fmInfo() << "CheckTPMLockout called";
 
-    if (!checkAuthentication(PolicyKitActionId::kQuery)) {
+    if (!checkAuthentication(PolicyKitActionId::kAccess)) {
         return kAuthFailed;
     }
 
@@ -174,7 +188,7 @@ int TPMControlDBus::IsSupportAlgo(const QString &algoName, bool &support)
 {
     fmInfo() << "IsSupportAlgo called for:" << algoName;
 
-    if (!checkAuthentication(PolicyKitActionId::kQuery)) {
+    if (!checkAuthentication(PolicyKitActionId::kAccess)) {
         return kAuthFailed;
     }
 
@@ -185,7 +199,7 @@ int TPMControlDBus::OwnerAuthStatus()
 {
     fmInfo() << "OwnerAuthStatus called";
 
-    if (!checkAuthentication(PolicyKitActionId::kQuery)) {
+    if (!checkAuthentication(PolicyKitActionId::kAccess)) {
         return kAuthFailed;
     }
 
@@ -196,7 +210,8 @@ int TPMControlDBus::GetRandom(int size, QDBusUnixFileDescriptor &randomData)
 {
     fmInfo() << "GetRandom called with size:" << size;
 
-    if (!checkAuthentication(PolicyKitActionId::kEncrypt)) {
+    if (!checkAuthentication(PolicyKitActionId::kAccess)) {
+        setFallbackFd(&randomData);
         return kAuthFailed;
     }
 
@@ -204,12 +219,14 @@ int TPMControlDBus::GetRandom(int size, QDBusUnixFileDescriptor &randomData)
     int ret = m_tpmWork->getRandom(size, &output);
     if (ret != 0) {
         fmWarning() << "getRandom failed with code:" << ret;
+        setFallbackFd(&randomData);
         return ret;
     }
 
     // Send random data via file descriptor
     QByteArray data = output.toUtf8();
     if (!sendDataViaFd(data, randomData)) {
+        setFallbackFd(&randomData);
         return kFdCreateFailed;
     }
 
@@ -221,7 +238,7 @@ int TPMControlDBus::Encrypt(const QDBusUnixFileDescriptor &params)
 {
     fmInfo() << "Encrypt called";
 
-    if (!checkAuthentication(PolicyKitActionId::kEncrypt)) {
+    if (!checkAuthentication(PolicyKitActionId::kAccess)) {
         return kAuthFailed;
     }
 
@@ -239,7 +256,8 @@ int TPMControlDBus::Decrypt(const QDBusUnixFileDescriptor &params, QDBusUnixFile
 {
     fmInfo() << "Decrypt called";
 
-    if (!checkAuthentication(PolicyKitActionId::kDecrypt)) {
+    if (!checkAuthentication(PolicyKitActionId::kAccess)) {
+        setFallbackFd(&password);
         return kAuthFailed;
     }
 
@@ -247,6 +265,7 @@ int TPMControlDBus::Decrypt(const QDBusUnixFileDescriptor &params, QDBusUnixFile
     QVariantMap args;
     if (!parseCredentialsFromFd(params, &args)) {
         fmCritical() << "Failed to parse decrypt parameters from fd";
+        setFallbackFd(&password);
         return kFdReadFailed;
     }
 
@@ -254,12 +273,14 @@ int TPMControlDBus::Decrypt(const QDBusUnixFileDescriptor &params, QDBusUnixFile
     int ret = m_tpmWork->decrypt(args, &pwd);
     if (ret != 0) {
         fmWarning() << "decrypt failed with code:" << ret;
+        setFallbackFd(&password);
         return ret;
     }
 
     // Send decrypted password via file descriptor
     QByteArray data = pwd.toUtf8();
     if (!sendDataViaFd(data, password)) {
+        setFallbackFd(&password);
         return kFdCreateFailed;
     }
 

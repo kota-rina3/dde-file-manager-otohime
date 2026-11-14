@@ -278,6 +278,8 @@ void DDciIconPreview::initControlWidgets()
     IconOptionWidget *availableSizeWidget = new IconOptionWidget;
     availableSizeWidget->setTitleText(tr("Available sizes: "));
     this->availableSizeCombo = new QComboBox();
+    availableSizeCombo->setObjectName("AvailableSizeCombo");
+    this->availableSizeCombo->setAccessibleName("AvailableSizeCombo");
     this->availableSizeCombo->insertItem(this->availableSizeCombo->count(), tr("Custom Size"));
     availableSizeWidget->addHeaderWidget(this->availableSizeCombo);
 
@@ -286,6 +288,8 @@ void DDciIconPreview::initControlWidgets()
     customSizeLayout->setContentsMargins(0, 0, 0, 0);
 
     this->customSizeEdit = new QLineEdit();
+    customSizeEdit->setObjectName("CustomSizeEdit");
+    this->customSizeEdit->setAccessibleName("CustomSizeEdit");
     QObject::connect(this->customSizeEdit, &QLineEdit::editingFinished, this, std::bind(&DDciIconPreview::updatePixmap, this));
     this->customSizeEdit->setClearButtonEnabled(true);
     this->customSizeEdit->setFixedWidth(120);
@@ -329,12 +333,16 @@ void DDciIconPreview::initControlWidgets()
     IconOptionWidget *themeWidget = new IconOptionWidget;
     themeWidget->setTitleText(tr("Theme: "));
     this->themeCom = new QComboBox(this->controlWidget);
+    themeCom->setObjectName("ThemeCom");
+    this->themeCom->setAccessibleName("ThemeCom");
     this->themeCom->addItems({ tr("Light"), tr("Dark") });
     themeWidget->addHeaderWidget(this->themeCom);
 
     IconOptionWidget *modeWidget = new IconOptionWidget;
     modeWidget->setTitleText(tr("Mode: "));
     this->modeCom = new QComboBox(this->controlWidget);
+    modeCom->setObjectName("ModeCom");
+    this->modeCom->setAccessibleName("ModeCom");
     this->modeCom->addItems({ tr("Normal"), tr("Disabled"), tr("Hovered"), tr("Pressed") });
     modeWidget->addHeaderWidget(this->modeCom);
 
@@ -366,6 +374,8 @@ void DDciIconPreview::initControlWidgets()
     font.setPointSize(10);
     foregroundPaletteTitle->setFont(font);
     this->foregroundPaletteEdit = new QLineEdit(this->controlWidget);
+    foregroundPaletteEdit->setObjectName("ForegroundPaletteEdit");
+    this->foregroundPaletteEdit->setAccessibleName("ForegroundPaletteEdit");
     this->foregroundPaletteEdit->setText(this->mainWidget->palette().windowText().color().name());
     this->foregroundPaletteEdit->setFixedWidth(100);
     this->foregroundPaletteEdit->setFont(font);
@@ -378,6 +388,8 @@ void DDciIconPreview::initControlWidgets()
     QLabel *backgroundPaletteTitle = new QLabel(tr("Background:"), this->controlWidget);
     backgroundPaletteTitle->setFixedWidth(140);
     this->backgroundPaletteEdit = new QLineEdit(this->controlWidget);
+    backgroundPaletteEdit->setObjectName("BackgroundPaletteEdit");
+    this->backgroundPaletteEdit->setAccessibleName("BackgroundPaletteEdit");
     this->backgroundPaletteEdit->setText(this->mainWidget->palette().window().color().name());
     this->backgroundPaletteEdit->setFixedWidth(100);
     this->backgroundPaletteEdit->setFont(font);
@@ -391,6 +403,8 @@ void DDciIconPreview::initControlWidgets()
     QLabel *hightlightPaletteTitle = new QLabel(tr("Highlight:"), this->controlWidget);
     hightlightPaletteTitle->setFixedWidth(140);
     this->hightlightPaletteEdit = new QLineEdit(this->controlWidget);
+    hightlightPaletteEdit->setObjectName("HightlightPaletteEdit");
+    this->hightlightPaletteEdit->setAccessibleName("HightlightPaletteEdit");
     this->hightlightPaletteEdit->setText(this->mainWidget->palette().highlight().color().name());
     this->hightlightPaletteEdit->setFixedWidth(100);
     this->hightlightPaletteEdit->setFont(font);
@@ -404,6 +418,8 @@ void DDciIconPreview::initControlWidgets()
     hFPaletteTitle->setFixedWidth(140);
     hFPaletteTitle->setFont(font);
     this->hFPaletteEdit = new QLineEdit(this->controlWidget);
+    hFPaletteEdit->setObjectName("HFpaletteEdit");
+    this->hFPaletteEdit->setAccessibleName("HFpaletteEdit");
     this->hFPaletteEdit->setText(this->mainWidget->palette().highlightedText().color().name());
     this->hFPaletteEdit->setFixedWidth(100);
     this->hFPaletteEdit->setFont(font);

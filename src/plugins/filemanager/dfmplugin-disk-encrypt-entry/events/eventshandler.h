@@ -18,6 +18,7 @@ public:
     static EventsHandler *instance();
     void bindDaemonSignals();
     void hookEvents();
+    void checkPendingOverlayDMNotify();
     bool isTaskWorking();
     bool hasPendingTask();
     QString unfinishedDecryptJob();
@@ -51,6 +52,7 @@ private Q_SLOTS:
 
     void requestReboot();
     bool canUnlock(const QString &device);
+    bool saveRecoveryKeyToFile(const QString &recKey, const QString &dev, const QString &exportPath);
 
 private:
     explicit EventsHandler(QObject *parent = nullptr);
@@ -58,6 +60,7 @@ private:
     QMap<QString, QPointer<EncryptProgressDialog>> encryptDialogs;
     QMap<QString, QPointer<EncryptProgressDialog>> decryptDialogs;
     QMap<QString, QPointer<EncryptParamsInputDialog>> encryptInputs;
+    QMap<QString, QString> exportPaths;
 signals:
 };
 }

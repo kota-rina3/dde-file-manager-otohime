@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "asyncfileinfo.h"
+#include "localfileinfodefs.h"
 #include "private/asyncfileinfo_p.h"
 
 #include <dfm-base/base/urlroute.h>
@@ -10,6 +11,7 @@
 #include <dfm-base/base/schemefactory.h>
 #include <dfm-base/utils/chinese2pinyin.h>
 #include <dfm-base/utils/sysinfoutils.h>
+#include <dfm-base/utils/iconutils.h>
 #include <dfm-base/file/local/localfileiconprovider.h>
 #include <dfm-base/mimetype/dmimedatabase.h>
 #include <dfm-base/mimetype/mimetypedisplaymanager.h>
@@ -84,6 +86,8 @@ void AsyncFileInfo::refresh()
     {
         QWriteLocker lk(&extendOtherCacheLock);
         extendOtherCache.remove(ExtInfoType::kFileThumbnail);
+        extendOtherCache.remove(ExtInfoType::kFileCanTag);
+        extendOtherCache.remove(ExtInfoType::kFileEmblems);
     }
 }
 
@@ -581,7 +585,10 @@ QMultiMap<QUrl, QString> AsyncFileInfo::notifyUrls() const
 // if url is unvalid, it will clear all notify urls
 void AsyncFileInfo::setNotifyUrl(const QUrl &url, const QString &infoPtr)
 {
-    assert(infoPtr != QString::number(quintptr(this), 16));
+    if (infoPtr == QString::number(quintptr(this), 16)) {
+        qCWarning(logDFMBase) << "AsyncFileInfo::setNotifyUrl: skip self-registration to avoid endless refresh loop, url:" << url << "token:" << infoPtr;
+        return;
+    }
     if (!url.isValid()) {
         QMutexLocker lk(&d->notifyLock);
         d->notifyUrls.clear();
@@ -614,6 +621,11 @@ int AsyncFileInfo::cacheAsyncAttributes(const QString &attributes)
     if (!d->cacheingAttributes)
         d->cacheingAttributes = true;
     auto result = d->cacheAllAttributes(attributes);
+    {
+        QWriteLocker locker(&extendOtherCacheLock);
+        extendOtherCache.remove(ExtInfoType::kFileCanTag);
+        extendOtherCache.remove(ExtInfoType::kFileEmblems);
+    }
     d->cacheingAttributes = false;
     return result;
 }
@@ -683,7 +695,7 @@ void AsyncFileInfoPrivate::init(const QUrl &url, QSharedPointer<DFMIO::DFileInfo
         tokenKey = quintptr(dfmFileInfo.data());
         return;
     }
-    dfmFileInfo.reset(new DFileInfo(cvtResultUrl));
+    dfmFileInfo.reset(new DFileInfo(cvtResultUrl, kFileAttributes));
     if (!dfmFileInfo) {
         qCWarning(logDFMBase, "Failed, dfm-io use factory create fileinfo");
         abort();
@@ -790,19 +802,29 @@ QString AsyncFileInfoPrivate::completeSuffix() const
 
 QString AsyncFileInfoPrivate::iconName() const
 {
-    QString iconNameValue;
-    if (SystemPathUtil::instance()->isSystemPath(asyncAttribute(FileInfo::FileInfoAttributeID::kStandardFilePath).toString()))
-        iconNameValue = SystemPathUtil::instance()->systemPathIconNameByPath(asyncAttribute(FileInfo::FileInfoAttributeID::kStandardFilePath).toString());
-
-    if (iconNameValue.isEmpty()) {
-        const QStringList &list = asyncAttribute(FileInfo::FileInfoAttributeID::kStandardIcon).toStringList();
-        if (!list.isEmpty())
-            iconNameValue = list.first();
+    {
+        QReadLocker rlk(&iconLock);
+        if (!fileIconName.isEmpty())
+            return fileIconName;
     }
-    if (!ProtocolUtils::isRemoteFile(q->fileUrl()) && iconNameValue.isEmpty())
-        iconNameValue = q->fileMimeType().iconName();
-    if (iconNameValue.isEmpty() && q->isAttributes(OptInfoType::kIsDir))
-        iconNameValue = "folder";
+
+    if (this->attribute(DFileInfo::AttributeID::kStandardIsDir).toBool()) {
+        QWriteLocker wlk(&iconLock);
+        if (!fileIconName.isEmpty())
+            return fileIconName;
+        fileIconName = "inode-directory";
+        return fileIconName;
+    }
+
+    auto mimetype = q->fileMimeType();
+    QString iconNameValue = mimetype.iconName();
+
+    iconNameValue = IconUtils::normalizeIconName(iconNameValue);
+
+    QWriteLocker wlk(&iconLock);
+    if (!fileIconName.isEmpty())
+        return fileIconName;
+    fileIconName = iconNameValue;
     return iconNameValue;
 }
 
@@ -1132,7 +1154,9 @@ int AsyncFileInfoPrivate::cacheAllAttributes(const QString &attributes)
         && !ProtocolUtils::isLocalFile(QUrl::fromLocalFile(symlink))) {
         FileInfoPointer info = InfoFactory::create<FileInfo>(QUrl::fromLocalFile(symlink));
         auto asyncInfo = info.dynamicCast<AsyncFileInfo>();
-        if (asyncInfo) {
+        if (asyncInfo.data() == q) {
+            qCDebug(logDFMBase) << "AsyncFileInfoPrivate::cacheAllAttributes: skip notify registration and refresh for self-referenced symlink:" << q->fileUrl();
+        } else if (asyncInfo) {
             asyncInfo->setNotifyUrl(q->fileUrl(), QString::number(quintptr(q), 16));
             auto notifyUrls = q->notifyUrls();
             for (const auto &url : notifyUrls.keys()) {
@@ -1192,6 +1216,7 @@ int AsyncFileInfoPrivate::cacheAllAttributes(const QString &attributes)
     if (q->nameOf(NameInfoType::kIconName) != attribute(DFileInfo::AttributeID::kStandardIcon)) {
         QWriteLocker rlk(&iconLock);
         fileIcon = QIcon();
+        fileIconName.clear();
     }
 
     {
@@ -1208,6 +1233,8 @@ int AsyncFileInfoPrivate::cacheAllAttributes(const QString &attributes)
         if (changesAttributes.contains(FileInfo::FileInfoAttributeID::kStandardFileType) || changesAttributes.contains(FileInfo::FileInfoAttributeID::kStandardFileExists) || changesAttributes.contains(FileInfo::FileInfoAttributeID::kStandardContentType))
             fileMimeTypeAsync();   // kMimeTypeName
     }
+
+    updateFileIconName();
 
     return 2;
 }
@@ -1280,6 +1307,28 @@ bool AsyncFileInfoPrivate::hasAsyncAttribute(FileInfo::FileInfoAttributeID key)
 {
     QMutexLocker lk(&lock);
     return cacheAsyncAttributes.contains(key);
+}
+
+void AsyncFileInfoPrivate::updateFileIconName()
+{
+    if (this->attribute(DFileInfo::AttributeID::kStandardIsDir).toBool()) {
+        QWriteLocker wlk(&iconLock);
+        fileIconName = "inode-directory";
+        return;
+    }
+
+    QString iconNameValue;
+    if (SystemPathUtil::instance()->isSystemPath(asyncAttribute(FileInfo::FileInfoAttributeID::kStandardFilePath).toString()))
+        iconNameValue = SystemPathUtil::instance()->systemPathIconNameByPath(asyncAttribute(FileInfo::FileInfoAttributeID::kStandardFilePath).toString());
+
+    auto mimetype = q->fileMimeType();
+    if (iconNameValue.isEmpty())
+        iconNameValue = mimetype.iconName();
+
+    iconNameValue = IconUtils::normalizeIconName(iconNameValue);
+
+    QWriteLocker wlk(&iconLock);
+    fileIconName = iconNameValue;
 }
 
 }

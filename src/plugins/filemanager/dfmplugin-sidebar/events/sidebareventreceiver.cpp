@@ -9,6 +9,7 @@
 #include "treemodels/sidebarmodel.h"
 #include "utils/sidebarhelper.h"
 #include "utils/sidebarinfocachemananger.h"
+#include "utils/devicemountsubscriber.h"
 
 #include <dfm-base/widgets/filemanagerwindowsmanager.h>
 #include <dfm-base/dfm_global_defines.h>
@@ -72,7 +73,10 @@ void SideBarEventReceiver::bindEvents()
     dpfSlotChannel->connect(kCurrentEventSpace, "slot_Item_Remove", this, &SideBarEventReceiver::handleItemRemove);
     dpfSlotChannel->connect(kCurrentEventSpace, "slot_Item_Update", this, &SideBarEventReceiver::handleItemUpdate);
     dpfSlotChannel->connect(kCurrentEventSpace, "slot_Item_Insert", this, &SideBarEventReceiver::handleItemInsert);
-    dpfSlotChannel->connect(kCurrentEventSpace, "slot_Item_Hidden", this, &SideBarEventReceiver::handleItemHidden);
+    dpfSlotChannel->connect(kCurrentEventSpace, "slot_Item_Hidden", this,
+                            static_cast<void (SideBarEventReceiver::*)(const QUrl &, bool)>(&SideBarEventReceiver::handleItemHidden));
+    dpfSlotChannel->connect(kCurrentEventSpace, "slot_Item_Hidden", this,
+                            static_cast<void (SideBarEventReceiver::*)(quint64, const QUrl &, bool)>(&SideBarEventReceiver::handleItemHidden));
     dpfSlotChannel->connect(kCurrentEventSpace, "slot_Item_TriggerEdit", this, &SideBarEventReceiver::handleItemTriggerEdit);
     dpfSlotChannel->connect(kCurrentEventSpace, "slot_Sidebar_UpdateSelection", this, &SideBarEventReceiver::handleSidebarUpdateSelection);
 }
@@ -82,6 +86,15 @@ void SideBarEventReceiver::handleItemHidden(const QUrl &url, bool visible)
     QList<SideBarWidget *> allSideBar = SideBarHelper::allSideBar();
     for (SideBarWidget *sidebar : allSideBar)
         sidebar->setItemVisiable(url, visible);
+}
+
+void SideBarEventReceiver::handleItemHidden(quint64 winId, const QUrl &url, bool visible)
+{
+    QList<SideBarWidget *> allSideBar = SideBarHelper::allSideBar();
+    for (SideBarWidget *sidebar : allSideBar) {
+        if (SideBarHelper::windowId(sidebar) == winId)
+            sidebar->setItemVisiable(url, visible);
+    }
 }
 
 void SideBarEventReceiver::handleItemTriggerEdit(quint64 winId, const QUrl &url)
@@ -173,12 +186,17 @@ bool SideBarEventReceiver::handleItemRemove(const QUrl &url)
 
 bool SideBarEventReceiver::handleItemUpdate(const QUrl &url, const QVariantMap &properties)
 {
-    if (!SideBarInfoCacheMananger::instance()->contains(url)) {
+    bool hasGroup = properties.contains(PropertyKey::kGroup);
+    QString group = hasGroup ? properties[PropertyKey::kGroup].toString() : QString();
+
+    auto *cacheMgr = SideBarInfoCacheMananger::instance();
+    bool found = hasGroup ? cacheMgr->contains(group, url) : cacheMgr->contains(url);
+    if (!found) {
         fmWarning() << "Item not found in cache for update, url:" << url;
         return false;
     }
 
-    ItemInfo info { SideBarInfoCacheMananger::instance()->itemInfo(url) };
+    ItemInfo info = hasGroup ? cacheMgr->itemInfo(group, url) : cacheMgr->itemInfo(url);
 
     bool urlUpdated { false };
     if (properties.contains(PropertyKey::kUrl)) {
@@ -186,7 +204,10 @@ bool SideBarEventReceiver::handleItemUpdate(const QUrl &url, const QVariantMap &
         if (!DFMBASE_NAMESPACE::UniversalUtils::urlEquals(newUrl, info.url)) {
             urlUpdated = true;
             info.url = newUrl;
-            SideBarInfoCacheMananger::instance()->removeItemInfoCache(url);
+            if (hasGroup)
+                cacheMgr->removeItemInfoCache(group, url);
+            else
+                cacheMgr->removeItemInfoCache(url);
         }
     }
 
@@ -200,8 +221,15 @@ bool SideBarEventReceiver::handleItemUpdate(const QUrl &url, const QVariantMap &
         info.editDisplayText = properties[PropertyKey::kEditDisplayText].toString();
     if (properties.contains(PropertyKey::kIcon))
         info.icon = qvariant_cast<QIcon>(properties[PropertyKey::kIcon]);
-    if (properties.contains(PropertyKey::kFinalUrl))
+    if (properties.contains(PropertyKey::kFinalUrl)) {
         info.finalUrl = properties[PropertyKey::kFinalUrl].toUrl();
+        // Notify device mount subscribers when a device's finalUrl becomes valid.
+        if (info.finalUrl.isValid() && info.group == DefaultGroup::kDevice && info.finalUrl.scheme() == "file") {
+            fmDebug() << "SideBarEventReceiver: Device mounted, notifying subscribers:"
+                      << url << "at" << info.finalUrl;
+            DeviceMountSubscriber::instance()->notifyMountFinished(url, info.finalUrl);
+        }
+    }
     if (properties.contains(PropertyKey::kQtItemFlags))
         info.flags = qvariant_cast<Qt::ItemFlags>(properties[PropertyKey::kQtItemFlags]);
     if (properties.contains(PropertyKey::kIsEjectable))
@@ -214,6 +242,8 @@ bool SideBarEventReceiver::handleItemUpdate(const QUrl &url, const QVariantMap &
         info.visiableDisplayName = properties[PropertyKey::kVisiableDisplayName].toString();
     if (properties.contains(PropertyKey::kReportName))
         info.reportName = properties[PropertyKey::kReportName].toString();
+    if (properties.contains(PropertyKey::kItemExpandable))
+        info.isExpandable = properties[PropertyKey::kItemExpandable].toBool();
 
     if (properties.contains(PropertyKey::kCallbackItemClicked))
         info.clickedCb = DPF_NAMESPACE::paramGenerator<ItemClickedActionCallback>(properties[PropertyKey::kCallbackItemClicked]);
@@ -228,7 +258,7 @@ bool SideBarEventReceiver::handleItemUpdate(const QUrl &url, const QVariantMap &
     if (urlUpdated)
         ret = SideBarInfoCacheMananger::instance()->addItemInfoCache(info);
     else
-        ret = SideBarInfoCacheMananger::instance()->updateItemInfoCache(url, info);
+        ret = SideBarInfoCacheMananger::instance()->updateItemInfoCache(info.group, url, info);
 
     QList<SideBarWidget *> allSideBar = SideBarHelper::allSideBar();
     if (!allSideBar.isEmpty()) {

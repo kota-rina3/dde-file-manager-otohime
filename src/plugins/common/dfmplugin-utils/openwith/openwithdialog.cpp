@@ -32,6 +32,7 @@
 #include <DPushButton>
 #include <DSuggestButton>
 #include <DLabel>
+#include <DToolTip>
 #include <DCheckBox>
 #include <DCommandLinkButton>
 #include <DHorizontalLine>
@@ -55,9 +56,14 @@ OpenWithDialogListItem::OpenWithDialogListItem(const QString &iconName, const QS
       label(new DLabel(this))
 
 {
+    checkButton->setObjectName("CheckButton");
+    checkButton->setAccessibleName("CheckButton");
     checkButton->setFixedSize(15, 15);
     checkButton->setFlat(true);
     label->setText(text);
+    label->setElideMode(Qt::ElideMiddle);
+    label->setToolTip(text);
+    DToolTip::setToolTipShowMode(label, DToolTip::ShowWhenElided);
     iconLabel->setAlignment(Qt::AlignCenter);
 
     QHBoxLayout *layout = new QHBoxLayout(this);
@@ -87,11 +93,11 @@ void OpenWithDialogListItem::initUiForSizeMode()
 {
 #ifdef DTKWIDGET_CLASS_DSizeMode
     int size = DSizeModeHelper::element(25, 30);
-    setFixedSize(220, DSizeModeHelper::element(40, 50));
+    setFixedSize(224, DSizeModeHelper::element(40, 50));
 #else
     int size = 30;
     iconLabel->setPixmap(icon.pixmap(iconLabel->size()));
-    setFixedSize(220, 50);
+    setFixedSize(224, 50);
 #endif
     iconLabel->setFixedSize(size, size);
     updateLabelIcon(size);
@@ -157,13 +163,16 @@ void OpenWithDialogListItem::paintEvent(QPaintEvent *e)
 
     path.addRoundedRect(rect(), 6, 6);
     pa.setRenderHint(QPainter::Antialiasing);
-    pa.fillPath(path, QColor(0, 0, 0, static_cast<int>(0.05 * 255)));
+    bool isLightTheme = (DGuiApplicationHelper::instance()->themeType() == DGuiApplicationHelper::LightType);
+    int alpha = static_cast<int>(0.05 * 255);
+    QColor hoverColor = isLightTheme ? QColor(0, 0, 0, alpha) : QColor(255, 255, 255, alpha);
+    pa.fillPath(path, hoverColor);
 }
 
 class OpenWithDialogListSparerItem : public QWidget
 {
 public:
-    explicit OpenWithDialogListSparerItem(const QString &title, QWidget *parent = nullptr);
+    explicit OpenWithDialogListSparerItem(const QString &title, QWidget *parent = nullptr, bool showSeparator = true);
 
 private slots:
     void initUiForSizeMode();
@@ -187,17 +196,21 @@ void OpenWithDialogListSparerItem::initUiForSizeMode()
 #endif
 }
 
-OpenWithDialogListSparerItem::OpenWithDialogListSparerItem(const QString &title, QWidget *parent)
-    : QWidget(parent), separator(new DHorizontalLine(this)), titleLabel(new QLabel(title, this))
+OpenWithDialogListSparerItem::OpenWithDialogListSparerItem(const QString &title, QWidget *parent, bool showSeparator)
+    : QWidget(parent), titleLabel(new QLabel(title, this))
 {
 #ifdef DTKWIDGET_CLASS_DSizeMode
     connect(DGuiApplicationHelper::instance(), &DGuiApplicationHelper::sizeModeChanged, this, &OpenWithDialogListSparerItem::initUiForSizeMode);
 #endif
     QVBoxLayout *layout = new QVBoxLayout(this);
     initUiForSizeMode();
-    layout->addWidget(separator);
+    if (showSeparator) {
+        separator = new DHorizontalLine(this);
+        layout->addWidget(separator);
+    }
     layout->addWidget(titleLabel);
-    layout->setContentsMargins(20, 0, 20, 0);
+    layout->setContentsMargins(0, 0, 0, 0);
+    titleLabel->setContentsMargins(20, 0, 0, 0);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 }
 
@@ -281,20 +294,32 @@ void OpenWithDialog::initUI()
     scrollArea->setWidget(contentWidget);
 
     recommandLayout = new DFlowLayout;
+    recommandLayout->setHorizontalSpacing(10);
+    recommandLayout->setContentsMargins(0, 0, 0, 0);
     otherLayout = new DFlowLayout;
+    otherLayout->setHorizontalSpacing(10);
+    otherLayout->setContentsMargins(0, 0, 0, 0);
 
     openFileChooseButton = new DCommandLinkButton(tr("Add other programs"), this);
+    openFileChooseButton->setObjectName("OpenFileChooseButton");
+    openFileChooseButton->setAccessibleName("OpenFileChooseButton");
     setToDefaultCheckBox = new DCheckBox(tr("Set as default"), this);
+    setToDefaultCheckBox->setObjectName("SetToDefaultCheckBox");
+    setToDefaultCheckBox->setAccessibleName("SetToDefaultCheckBox");
     setToDefaultCheckBox->setChecked(true);
     cancelButton = new DPushButton(tr("Cancel", "button"));
+    cancelButton->setObjectName("CancelButton");
+    cancelButton->setAccessibleName("CancelButton");
     chooseButton = new DSuggestButton(tr("Confirm", "button"));
+    chooseButton->setObjectName("ChooseButton");
+    chooseButton->setAccessibleName("ChooseButton");
     cancelButton->setMinimumWidth(78);
     chooseButton->setMinimumWidth(78);
     chooseButton->setFocus();
 
     QVBoxLayout *contentLayout = new QVBoxLayout;
     contentLayout->setContentsMargins(10, 0, 10, 0);
-    contentLayout->addWidget(new OpenWithDialogListSparerItem(tr("Recommended Applications"), this));
+    contentLayout->addWidget(new OpenWithDialogListSparerItem(tr("Recommended Applications"), this, false));
     contentLayout->addLayout(recommandLayout);
     contentLayout->addWidget(new OpenWithDialogListSparerItem(tr("Other Applications"), this));
     contentLayout->addLayout(otherLayout);
@@ -308,7 +333,7 @@ void OpenWithDialog::initUI()
     buttonLayout->addWidget(setToDefaultCheckBox);
     buttonLayout->addSpacing(20);
     buttonLayout->addWidget(cancelButton);
-    buttonLayout->addSpacing(5);
+    buttonLayout->addSpacing(10);
     buttonLayout->addWidget(chooseButton);
     buttonLayout->setContentsMargins(10, 0, 10, 0);
 
@@ -316,7 +341,7 @@ void OpenWithDialog::initUI()
     QVBoxLayout *bottomLayout = new QVBoxLayout;
 
     bottomLayout->addWidget(new DHorizontalLine(this));
-    bottomLayout->addSpacing(5);
+    bottomLayout->addSpacing(10);
     bottomLayout->addLayout(buttonLayout);
     bottomLayout->setContentsMargins(10, 0, 10, 0);
 
@@ -326,6 +351,13 @@ void OpenWithDialog::initUI()
     mainLayout->addSpacing(15);
 #endif
     mainLayout->setSpacing(0);
+
+    // 固定分割线：位于大标题下方，不随内容滚动而消失
+    QHBoxLayout *titleSeparatorLayout = new QHBoxLayout;
+    titleSeparatorLayout->setContentsMargins(10, 0, 10, 0);
+    titleSeparatorLayout->addWidget(new DHorizontalLine(this));
+    mainLayout->addLayout(titleSeparatorLayout);
+
     mainLayout->addWidget(scrollArea);
     mainLayout->addLayout(bottomLayout);
     mainLayout->setContentsMargins(0, 35, 0, 10);
@@ -573,7 +605,7 @@ void OpenWithDialog::showEvent(QShowEvent *event)
 {
     BaseDialog::showEvent(event);
 
-    recommandLayout->parentWidget()->setFixedWidth(scrollArea->width());
+    recommandLayout->parentWidget()->setFixedWidth(scrollArea->viewport()->width());
     recommandLayout->parentWidget()->resize(recommandLayout->parentWidget()->layout()->sizeHint());
 }
 

@@ -12,9 +12,12 @@
 #
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-BUILD_DIR="${PROJECT_ROOT}/build-autotests"
+export SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export BUILD_DIR="${PROJECT_ROOT}/build-autotests"
+export builddir=build-autotests
+export reportdir=build-autotests
+export projectdir="${PROJECT_ROOT}"
 COVERAGE=false
 RUN_ONLY=false
 
@@ -65,10 +68,69 @@ if [ "${RUN_ONLY}" = false ]; then
     cmake --build "${BUILD_DIR}" -j"$(nproc)"
 fi
 
-# Step 3: Run tests
+# Step 3: Run tests and collect results
 echo "==> [3/4] Running tests..."
 cd "${BUILD_DIR}"
-ctest --output-on-failure --timeout 60
+
+# Use offscreen Qt platform to avoid display dependencies.
+export QT_QPA_PLATFORM="offscreen"
+
+# Ensure locally-built libraries (dfm6-base) are found at runtime
+# ahead of older system-installed copies, preventing symbol-resolution
+# failures.
+export LD_LIBRARY_PATH="${BUILD_DIR}/src/dfm-base${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+# Discover test binaries
+GTEST_RESULTS_DIR="${BUILD_DIR}/gtest-results"
+mkdir -p "${GTEST_RESULTS_DIR}"
+
+test_bins=()
+while IFS= read -r -d '' bin; do
+    test_bins+=("$bin")
+done < <(find "${BUILD_DIR}/autotests" -type f -executable -name 'ut-*' -print0 | sort -z)
+
+if [ ${#test_bins[@]} -eq 0 ]; then
+    echo "ERROR: No test binaries found under ${BUILD_DIR}/autotests"
+    exit 1
+fi
+
+echo "Found ${#test_bins[@]} test binaries:"
+for bin in "${test_bins[@]}"; do
+    echo "  $(basename "$bin")"
+done
+echo ""
+
+# Run each test binary with gtest XML output
+# Temporarily disable 'set -e' so a failing test binary doesn't abort the script;
+# we track failures via any_failed and report them at the end.
+# Each binary is capped at 10 minutes so a hung test can never block the
+# remaining ones; the run always produces a complete result set.
+UT_TIMEOUT_SEC=600
+any_failed=0
+set +e
+for bin in "${test_bins[@]}"; do
+    name=$(basename "$bin")
+    echo "---- Running ${name} (timeout ${UT_TIMEOUT_SEC}s) ----"
+    if timeout "${UT_TIMEOUT_SEC}" "$bin" --gtest_output="xml:${GTEST_RESULTS_DIR}/${name}.xml"; then
+        echo "  ${name}: PASSED"
+    else
+        rc=$?
+        if [ "$rc" -eq 124 ]; then
+            echo "  ${name}: FAILED (timeout after ${UT_TIMEOUT_SEC}s)"
+        else
+            echo "  ${name}: FAILED (exit ${rc})"
+        fi
+        any_failed=1
+    fi
+done
+set -e
+
+echo ""
+if [ "$any_failed" -eq 0 ]; then
+    echo "All test binaries passed."
+else
+    echo "Some test binaries FAILED."
+fi
 
 # Step 4: Coverage report
 if [ "${COVERAGE}" = true ]; then
@@ -77,9 +139,31 @@ if [ "${COVERAGE}" = true ]; then
     COVERAGE_DIR="${BUILD_DIR}/coverage"
     mkdir -p "${COVERAGE_DIR}"
 
-    # Collect coverage data
-    lcov --capture --directory "${BUILD_DIR}" --output-file "${COVERAGE_DIR}/coverage.info" \
+    # --- Baseline from .gcno (compiled-but-unrun source files) ---
+    # lcov --capture only reads .gcda runtime data and silently drops every
+    # file that was compiled with --coverage but never executed. That shrinks
+    # the denominator and inflates the coverage %. Capturing an initial
+    # baseline from the .gcno files and merging it back in forces those files
+    # into the report at 0%, so the figure reflects the real whole-project
+    # denominator rather than only what tests happened to touch.
+    lcov --capture --initial --directory "${BUILD_DIR}" \
+        --output-file "${COVERAGE_DIR}/baseline.info" \
         --rc lcov_branch_coverage=1 2>/dev/null || true
+
+    # --- Runtime coverage from .gcda (after test execution) ---
+    lcov --capture --directory "${BUILD_DIR}" \
+        --output-file "${COVERAGE_DIR}/run.info" \
+        --rc lcov_branch_coverage=1 2>/dev/null || true
+
+    # --- Merge: keep real hit counts; files only in the baseline stay at 0% ---
+    if [ -s "${COVERAGE_DIR}/baseline.info" ]; then
+        lcov --add-tracefile "${COVERAGE_DIR}/baseline.info" \
+            --add-tracefile "${COVERAGE_DIR}/run.info" \
+            --output-file "${COVERAGE_DIR}/coverage.info" \
+            --rc lcov_branch_coverage=1 2>/dev/null || true
+    else
+        cp "${COVERAGE_DIR}/run.info" "${COVERAGE_DIR}/coverage.info"
+    fi
 
     # Filter to only include project source files
     lcov --remove "${COVERAGE_DIR}/coverage.info" \
@@ -104,6 +188,17 @@ if [ "${COVERAGE}" = true ]; then
     lcov --summary "${COVERAGE_DIR}/coverage-filtered.info" --rc lcov_branch_coverage=1 2>/dev/null || \
         echo "Warning: Could not generate coverage summary (lcov may not be installed)"
 fi
+
+# Step 5: Generate summary JSON
+echo "==> Generating summary JSON: ${BUILD_DIR}/ut-summary.json"
+
+# dde-file-manager 的 gtest XML 和 coverage info 路径与默认不同，通过环境变量覆盖
+export GTEST_XML_DIR="${BUILD_DIR}/gtest-results"
+if [ "${COVERAGE}" = true ]; then
+    export COVERAGE_INFO="${BUILD_DIR}/coverage/coverage-filtered.info"
+fi
+
+python3 "${SCRIPT_DIR}/gen-ut-summary.py"
 
 echo ""
 echo "Done."

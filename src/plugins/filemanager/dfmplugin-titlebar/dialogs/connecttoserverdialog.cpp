@@ -31,6 +31,7 @@
 #    include <DSizeMode>
 #endif
 
+#include <algorithm>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -252,10 +253,15 @@ void ConnectToServerDialog::initServerDatas()
         }
     };
 
-    const QList<IPHistroyData> ipHistoryData = SearchHistroyManager::instance()->getIPHistory();
+    QList<IPHistroyData> ipHistoryData = SearchHistroyManager::instance()->getIPHistory();
+    std::sort(ipHistoryData.begin(), ipHistoryData.end(), [](const IPHistroyData &a, const IPHistroyData &b) {
+        return a.lastAccessed < b.lastAccessed;
+    });
+    QString mostRecentUrl;
     for (const auto &ipData : ipHistoryData) {
         if (ipData.isRecentlyAccessed()) {
             const QString ipStr = QString("%1://%2").arg(ipData.accessedType, ipData.ipData);
+            mostRecentUrl = ipStr.toLower();
             processUrl(ipStr);
         }
     }
@@ -283,7 +289,13 @@ void ConnectToServerDialog::initServerDatas()
     if (!hosts.isEmpty()) {
         // Add a clear-history action as the last item (customData true)
         serverComboBox->addItem(tr("Clear History"), true);
-        onCurrentInputChanged(hosts.last());
+        const QString &restoreUrl = mostRecentUrl.isEmpty() ? hosts.first() : mostRecentUrl;
+        const int restoreIndex = serverComboBox->findText(restoreUrl);
+        if (restoreIndex >= 0)
+            serverComboBox->setCurrentIndex(restoreIndex);
+        // initServerDatas runs before initConnect, so the currentTextChanged
+        // signal is not wired yet; split scheme/IP explicitly.
+        onCurrentInputChanged(restoreUrl);
     } else {
         // No history: show a disabled placeholder so dropdown shows a hint
         serverComboBox->addItem(tr("No history"));
@@ -373,6 +385,8 @@ void ConnectToServerDialog::initializeUi()
     // init address area
     {
         schemeComboBox = new DComboBox(this);
+        schemeComboBox->setObjectName("SchemeComboBox");
+        schemeComboBox->setAccessibleName("SchemeComboBox");
         supportedSchemes << QString("%1://").arg(Scheme::kSmb)
                          << QString("%1://").arg(Scheme::kFtp)
                          << QString("%1://").arg(Scheme::kSFtp)
@@ -389,12 +403,16 @@ void ConnectToServerDialog::initializeUi()
         completer->setMaxVisibleItems(kMaxHistoryItems);
 
         serverComboBox = new DComboBox(this);
+        serverComboBox->setObjectName("ServerComboBox");
+        serverComboBox->setAccessibleName("ServerComboBox");
         serverComboBox->setEditable(true);
         serverComboBox->setMaxVisibleItems(kMaxHistoryItems);
         serverComboBox->clearEditText();
         serverComboBox->setCompleter(completer);
 
         theAddButton = new DIconButton(this);
+        theAddButton->setObjectName("TheAddButton");
+        theAddButton->setAccessibleName("TheAddButton");
         theAddButton->setMaximumSize(38, 38);
         theAddButton->setFlat(false);
         theAddButton->setIconSize({ 16, 16 });
@@ -411,6 +429,8 @@ void ConnectToServerDialog::initializeUi()
         charsetLabel->setContentsMargins(8, 0, 0, 0);
 
         charsetComboBox = new DComboBox();
+        charsetComboBox->setObjectName("CharsetComboBox");
+        charsetComboBox->setAccessibleName("CharsetComboBox");
         charsetComboBox->addItems({ tr("Default"), "UTF-8", "GBK" });
         charsetComboBox->setVisible(false);
 
@@ -421,6 +441,8 @@ void ConnectToServerDialog::initializeUi()
     // init collection area
     {
         collectionServerView = new DListView();
+        collectionServerView->setObjectName("CollectionServerView");
+        collectionServerView->setAccessibleName("CollectionServerView");
         collectionServerView->setVerticalScrollMode(DListView::ScrollPerPixel);
         collectionServerView->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
         collectionServerView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);

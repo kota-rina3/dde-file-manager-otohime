@@ -12,6 +12,7 @@
 #include <dfm-base/utils/fileutils.h>
 #include <dfm-base/utils/fileinfohelper.h>
 #include <dfm-base/utils/universalutils.h>
+#include <dfm-base/utils/private/ddeshellwindow_p.h>
 #include <dfm-base/mimetype/dmimedatabase.h>
 #include <dfm-framework/dpf.h>
 
@@ -177,7 +178,12 @@ void FilePreviewDialog::childEvent(QChildEvent *event)
 
 void FilePreviewDialog::showEvent(QShowEvent *event)
 {
-    return DAbstractDialog::showEvent(event);
+    DAbstractDialog::showEvent(event);
+
+    // The preview is a transient chooser; the dock taskbar should not list it.
+    // On Treeland the skip-dock-preview bit of the dde shell protocol removes
+    // it from the compositor's toplevel lists; elsewhere the call is a no-op.
+    ddeshell::setSkipDockPreview(windowHandle(), true);
 }
 
 void FilePreviewDialog::closeEvent(QCloseEvent *event)
@@ -250,6 +256,8 @@ void FilePreviewDialog::initUI()
     qCDebug(logLibFilePreview) << "FilePreviewDialog: initializing UI components";
 
     closeBtn = new DFloatingButton(DStyle::SP_CloseButton, this);
+    closeBtn->setObjectName("CloseBtn");
+    closeBtn->setAccessibleName("CloseBtn");
     closeBtn->setStyleSheet("background-color: transparent;");
     closeBtn->setFixedSize(46, 46);
     closeBtn->setIconSize(QSize(40, 40));
@@ -261,6 +269,7 @@ void FilePreviewDialog::initUI()
     separator->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 
     statusBar = new FilePreviewDialogStatusBar(this);
+    statusBar->setAccessibleName("StatusBar");
     statusBar->setObjectName("StatusBar");
     statusBar->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     // statusBar->openButton()->setFocus();
@@ -299,6 +308,7 @@ void FilePreviewDialog::switchToPage(int index)
     saveCenterPos();
 
     currentPageIndex = index;
+    emit signalCurrentPageChanged(fileList.at(index));
     statusBar->preButton()->setEnabled(index > 0);
     statusBar->nextButton()->setEnabled(index < fileList.count() - 1);
 

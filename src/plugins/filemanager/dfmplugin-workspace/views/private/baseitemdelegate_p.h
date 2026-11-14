@@ -15,6 +15,11 @@
 #include <QStringList>
 #include <QtGlobal>
 #include <QMutex>
+#include <QTextOption>
+#include <QColor>
+#include <QIcon>
+
+#include <memory>
 
 QT_BEGIN_NAMESPACE
 class QLineEdit;
@@ -31,7 +36,18 @@ public:
     explicit BaseItemDelegatePrivate(BaseItemDelegate *qq);
     virtual ~BaseItemDelegatePrivate();
 
+    void setupElideLayout(dfmbase::ElideTextLayout *layout,
+                          const QString &text,
+                          QTextOption::WrapMode wrapMode,
+                          int lineHeight,
+                          int alignment,
+                          QPainter *painter,
+                          bool highlightEnabled,
+                          const QStringList &keywords,
+                          const QColor &highlightColor) const;
+
     void init();
+
 
     int textLineHeight { -1 };
     QSize itemSizeHint;
@@ -45,6 +61,8 @@ public:
     DFMBASE_NAMESPACE::ViewDefines viewDefines;
     QString hoveredTruncateGroupKey {};
     QString pressedTruncateGroupKey {};
+    // reusable ElideTextLayout for paint optimization, avoids repeated new/delete per paint cycle
+    mutable std::unique_ptr<dfmbase::ElideTextLayout> reusableElideLayout { nullptr };
 
     BaseItemDelegate *q_ptr;
     Q_DECLARE_PUBLIC(BaseItemDelegate)

@@ -45,6 +45,8 @@ SideBarWidget::SideBarWidget(QFrame *parent)
 {
     compositingConfig = DConfig::create("org.kde.kwin", "org.kde.kwin.compositing", QString(), this);
     sidebarView = new SideBarView(sidebarViewContainer);
+    sidebarView->setObjectName("SideBarView");
+    sidebarView->setAccessibleName(AcName::kAcDmSideBarView);
 #ifdef ENABLE_TESTING
     dpfSlotChannel->push("dfmplugin_utils", "slot_Accessible_SetAccessibleName",
                          qobject_cast<QWidget *>(sidebarView), AcName::kAcDmSideBarView);
@@ -120,6 +122,11 @@ bool SideBarWidget::removeItem(const QUrl &url)
 void SideBarWidget::updateItem(const QUrl &url, const ItemInfo &newInfo)
 {
     Q_ASSERT(qApp->thread() == QThread::currentThread());
+    // Drop the delegate's cached icon pixmap for this item before refreshing the
+    // model: the cache keys pixmaps by the item url, so a changed icon for the
+    // same url would otherwise be shadowed by the stale pixmap on the next paint.
+    if (auto *delegate = qobject_cast<SideBarItemDelegate *>(sidebarView->itemDelegate()))
+        delegate->invalidateIconCache(url);
     kSidebarModelIns->updateRow(url, newInfo);
     bool hidden { !SideBarHelper::hiddenRules().value(newInfo.visiableControlKey, true).toBool() };
     if (hidden)
@@ -136,7 +143,7 @@ int SideBarWidget::findItem(const QUrl &url) const
     // TODO(zhuangshu): In sidebar tree-model mode, this function is deprecated and be instead of findItemIndex()
     for (int i = 0; i < kSidebarModelIns->rowCount(); i++) {
         SideBarItem *item = kSidebarModelIns->itemFromIndex(i);
-        if (!dynamic_cast<SideBarItemSeparator *>(item)) {
+        if (item && !dynamic_cast<SideBarItemSeparator *>(item)) {
             bool foundByCb = item->itemInfo().findMeCb && item->itemInfo().findMeCb(item->url(), url);
             if (foundByCb || (item->url().scheme() == url.scheme() && item->url().path() == url.path()))
                 return i;
@@ -461,6 +468,7 @@ void SideBarWidget::initConnect()
     connect(kSidebarModelIns.data(), &SideBarModel::rowsInserted, sidebarView, &SideBarView::updateSeparatorVisibleState);
     connect(kSidebarModelIns.data(), &SideBarModel::rowsRemoved, sidebarView, &SideBarView::updateSeparatorVisibleState);
     connect(kSidebarModelIns.data(), &SideBarModel::rowsMoved, sidebarView, &SideBarView::updateSeparatorVisibleState);
+    connect(kSidebarModelIns.data(), &SideBarModel::requestCollapseItem, sidebarView, &SideBarView::onRequestCollapseItem);
 
     // 监听窗口特效模式切换
     connect(compositingConfig, &DConfig::valueChanged, this, [this](const QString &key) {
@@ -504,7 +512,10 @@ void SideBarWidget::initSettingPannel()
         for (auto item : items) {
             const QString &key { item->itemInfo().visiableControlKey };
             const QString &name { item->itemInfo().visiableDisplayName };
-            Q_ASSERT(!key.isEmpty() && !name.isEmpty());
+            if (key.isEmpty() || name.isEmpty()) {
+                fmWarning() << "skip item with empty key or name, group:" << group << "url:" << item->url();
+                continue;
+            }
             if (itemKeysMap[group].contains(key) || key == "hidden_me") {
                 fmDebug() << "reject key:" << key << group;
                 continue;

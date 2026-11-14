@@ -113,6 +113,8 @@ void FileViewStatusBar::initScalingSlider()
     fmDebug() << "Initializing scaling slider";
 
     scaleSlider = new DSlider(Qt::Horizontal, this);
+    scaleSlider->setObjectName("ScaleSlider");
+    scaleSlider->setAccessibleName("ScaleSlider");
     scaleSlider->adjustSize();
     scaleSlider->setFixedWidth(120);
     scaleSlider->setMaximum(1);
@@ -158,7 +160,7 @@ void FileViewStatusBar::setCustomLayout()
 {
     fmInfo() << "Setting up custom layout for FileViewStatusBar";
 
-    clearLayoutAndAnchors();
+    FileViewStatusBar::clearLayoutAndAnchors();
 
     if (!centerContainer) {
         // Create a container widget for center alignment

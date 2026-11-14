@@ -26,6 +26,8 @@ IndexStatusCheckBox::IndexStatusCheckBox(QWidget *parent)
     layout->setSpacing(4);
 
     m_checkBox = new QCheckBox(this);
+    m_checkBox->setObjectName("CheckBox");
+    m_checkBox->setAccessibleName("CheckBox");
     layout->addWidget(m_checkBox);
 
     auto *statusWidget = new QWidget(this);
@@ -44,7 +46,7 @@ IndexStatusCheckBox::IndexStatusCheckBox(QWidget *parent)
 
     m_iconLabel = new DTipLabel("", statusWidget);
     m_iconLabel->setFixedSize(16, 16);
-    m_iconLabel->setPixmap(iconPixmap("dialog-ok", 16));
+    m_iconLabel->setPixmap(iconPixmap("ok", 16));
 
     m_msgLabel = new DTipLabel("", statusWidget);
     m_msgLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
@@ -58,8 +60,8 @@ IndexStatusCheckBox::IndexStatusCheckBox(QWidget *parent)
     msgPolicy.setHorizontalStretch(1);
     m_msgLabel->setSizePolicy(msgPolicy);
 
-    connect(m_msgLabel, &QLabel::linkActivated, this, [this](const QString &) {
-        emit resetRequested();
+    connect(m_msgLabel, &QLabel::linkActivated, this, [this](const QString &href) {
+        emit resetRequested(href);
     });
 
     connect(m_checkBox, &QCheckBox::clicked, this, [this](bool checked) {
@@ -124,14 +126,21 @@ void IndexStatusCheckBox::setIndexingTexts(const QString &initialText,
 
 void IndexStatusCheckBox::setCompletedText(const QString &mainText, const QString &linkText, const QString &href)
 {
-    m_iconLabel->setPixmap(iconPixmap("dialog-ok", 16));
+    m_iconLabel->setPixmap(iconPixmap("ok", 16));
     setRunning(false);
     setFormattedTextWithLink(mainText, linkText, href);
 }
 
 void IndexStatusCheckBox::setFailedText(const QString &mainText, const QString &linkText, const QString &href)
 {
-    m_iconLabel->setPixmap(iconPixmap("dialog-error", 16));
+    m_iconLabel->setPixmap(iconPixmap("warning", 16));
+    setRunning(false);
+    setFormattedTextWithLink(mainText, linkText, href);
+}
+
+void IndexStatusCheckBox::setWaitingText(const QString &mainText, const QString &linkText, const QString &href)
+{
+    m_iconLabel->setPixmap(iconPixmap("waiting", 16));
     setRunning(false);
     setFormattedTextWithLink(mainText, linkText, href);
 }
@@ -149,12 +158,22 @@ void IndexStatusCheckBox::setStatus(Status status)
     case Status::Completed:
         setRunning(false);
         m_iconLabel->show();
-        m_iconLabel->setPixmap(iconPixmap("dialog-ok", 16));
+        m_iconLabel->setPixmap(iconPixmap("ok", 16));
         break;
     case Status::Failed:
         setRunning(false);
         m_iconLabel->show();
-        m_iconLabel->setPixmap(iconPixmap("dialog-error", 16));
+        m_iconLabel->setPixmap(iconPixmap("warning", 16));
+        break;
+    case Status::WaitingPower:
+    case Status::WaitingPowerSave:
+    case Status::WaitingIdle:
+    case Status::WaitingUpgrade:
+        // Waiting states use "waiting" icon, no spinner
+        m_spinner->hide();
+        m_spinner->stop();
+        m_iconLabel->show();
+        m_iconLabel->setPixmap(iconPixmap("waiting", 16));
         break;
     case Status::Inactive:
         m_spinner->hide();

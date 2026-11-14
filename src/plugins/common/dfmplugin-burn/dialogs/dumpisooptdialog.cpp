@@ -56,8 +56,11 @@ void DumpISOOptDialog::initliazeUi()
     addButton(QObject::tr("Cancel", "button"));
     int index = addButton(tr("Create ISO Image", "button"), true, DDialog::ButtonType::ButtonRecommend);
     createImgBtn = getButton(index);
-    if (createImgBtn)
+    if (createImgBtn) {
+        createImgBtn->setObjectName("CreateImgBtn");
+        createImgBtn->setAccessibleName("CreateImgBtn");
         createImgBtn->setEnabled(false);
+    }
     layout()->setContentsMargins(0, 0, 0, 0);
     contentWidget = new QWidget(this);
     // m_contentWidget->setStyleSheet("border: 1px solid red"); // debug
@@ -98,6 +101,8 @@ void DumpISOOptDialog::initliazeUi()
 
     // file chooser
     fileChooser = new DFileChooserEdit;
+    fileChooser->setObjectName("FileChooser");
+    fileChooser->setAccessibleName("FileChooser");
     fileChooser->setFileMode(QFileDialog::FileMode::Directory);
     const QString &stdDocPath = QStandardPaths::writableLocation(QStandardPaths::StandardLocation::DocumentsLocation);
     fileChooser->setDirectoryUrl(QUrl::fromLocalFile(stdDocPath));

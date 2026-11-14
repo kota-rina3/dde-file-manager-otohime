@@ -8,10 +8,12 @@
 #include <QDBusAbstractInterface>
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
+#include <QDBusMessage>
 #include <QDBusPendingCall>
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
 #include <QDBusReply>
+#include <QDBusServiceWatcher>
 #include <QDir>
 #include <QTimer>
 
@@ -47,6 +49,20 @@ void AbstractIndexController::initialize()
 
     keepAliveTimer->setInterval(5 * 60 * 1000);
     updateKeepAliveTimer();
+
+    // 监听索引服务的 DBus 注册/注销：服务异常退出后重新上线时，立即按 dconfig
+    // 开关恢复 SetEnabled，而不是等待 5 分钟一次的保活轮询。只恢复监控使能与
+    // 状态机，不主动触发重索引——停机期间丢失变更的补偿由服务端自愈机制决定
+    // （filename 索引有哨兵恢复；全文/OCR 索引设计上接受 Clean 状态的停机窗口）
+    serviceWatcher = new QDBusServiceWatcher(m_descriptor.dbusServiceName,
+                                             QDBusConnection::sessionBus(),
+                                             QDBusServiceWatcher::WatchForRegistration
+                                                     | QDBusServiceWatcher::WatchForUnregistration,
+                                             this);
+    connect(serviceWatcher, &QDBusServiceWatcher::serviceRegistered,
+            this, &AbstractIndexController::handleServiceRegistered);
+    connect(serviceWatcher, &QDBusServiceWatcher::serviceUnregistered,
+            this, &AbstractIndexController::handleServiceUnregistered);
 
     if (isConfigEnabled) {
         activeBackend(true);
@@ -142,7 +158,7 @@ void AbstractIndexController::setupStateHandlers()
                 fmWarning() << "[" << m_descriptor.controllerName << "] Failed to check index database existence:"
                             << reply.error().message();
             } else {
-                startIndexTask(!reply.value(), true);
+                startIndexTask(!reply.value());
             }
             watcher->deleteLater();
         });
@@ -200,7 +216,7 @@ void AbstractIndexController::setupDBusConnections()
     fmInfo() << "[" << m_descriptor.controllerName << "] DBus connections established successfully";
 }
 
-void AbstractIndexController::startIndexTask(bool isCreate, bool silent)
+void AbstractIndexController::startIndexTask(bool isCreate)
 {
     if (!interface) {
         fmWarning() << "[" << m_descriptor.controllerName << "] Cannot start index task, DBus interface not available";
@@ -211,11 +227,9 @@ void AbstractIndexController::startIndexTask(bool isCreate, bool silent)
     const QString method = isCreate ? QStringLiteral("CreateIndexTask") : QStringLiteral("UpdateIndexTask");
 
     fmInfo() << "[" << m_descriptor.controllerName << "] Starting" << (isCreate ? "CREATE" : "UPDATE")
-             << "index task for directory:" << paths << "silent:" << silent;
+             << "index task for directory:" << paths;
 
-    QVariantMap options;
-    options["silent"] = silent;
-    QDBusPendingCall pendingCall = interface->asyncCall(method, QVariant::fromValue(paths), options);
+    QDBusPendingCall pendingCall = interface->asyncCall(method, QVariant::fromValue(paths), QVariantMap());
     auto *watcher = new QDBusPendingCallWatcher(pendingCall, this);
     connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher](QDBusPendingCallWatcher *) {
         QDBusPendingReply<bool> reply = *watcher;
@@ -255,6 +269,29 @@ void AbstractIndexController::handleConfigChanged(const QString &config, const Q
     }
 }
 
+void AbstractIndexController::handleServiceRegistered()
+{
+    if (!isConfigEnabled) {
+        fmDebug() << "[" << m_descriptor.controllerName
+                  << "] Index service registered but config disabled, keep backend disabled";
+        return;
+    }
+
+    fmInfo() << "[" << m_descriptor.controllerName << "] Index service registered, restoring enabled state";
+    // 旧进程遗留的状态（如 Running）已失效：任务随进程消亡，TaskFinished 不会再到达。
+    // 仅复位状态机，不触发 Idle handler 的索引库检查/重索引。
+    updateState(State::Idle);
+    activeBackend(true);
+}
+
+void AbstractIndexController::handleServiceUnregistered()
+{
+    fmWarning() << "[" << m_descriptor.controllerName << "] Index service unregistered from DBus";
+    // 服务消失后任务不可能再完成，复位状态机；重新拉起由 systemd Restart /
+    // DBus activation（保活轮询的调用即可触发）完成，注册后走恢复流程。
+    updateState(State::Disabled);
+}
+
 void AbstractIndexController::activeBackend(bool isInit)
 {
     if (!isBackendAvaliable()) {
@@ -263,10 +300,9 @@ void AbstractIndexController::activeBackend(bool isInit)
     }
 
     if (isInit) {
-        // 延迟 2s 后发送 Init/SetEnabled，等待插件服务真正启动注册完成
+        // 延迟 2s 后发送 SetEnabled，等待插件服务真正启动注册完成
         QTimer::singleShot(2000, this, [this]() {
             if (interface) {
-                interface->asyncCall(QStringLiteral("Init"));
                 interface->asyncCall(QStringLiteral("SetEnabled"), isConfigEnabled);
             }
         });
@@ -282,16 +318,21 @@ void AbstractIndexController::keepBackendAlive()
         return;
     }
 
-    QDBusReply<bool> reply = interface->call(QStringLiteral("IsEnabled"));
-    if (!reply.isValid()) {
-        fmWarning() << "[" << m_descriptor.controllerName << "] Failed to query backend enabled state:" << reply.error().message();
-        return;
-    }
-
-    if (!reply.value() && isConfigEnabled) {
-        fmWarning() << "[" << m_descriptor.controllerName << "] Backend is disabled but config requires it enabled, reactivating backend";
-        activeBackend();
-    }
+    QDBusPendingCall pendingCall = interface->asyncCall(QStringLiteral("IsEnabled"));
+    auto *watcher = new QDBusPendingCallWatcher(pendingCall, this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher](QDBusPendingCallWatcher *) {
+        QDBusMessage reply = watcher->reply();
+        if (reply.type() == QDBusMessage::ErrorMessage) {
+            fmWarning() << "[" << m_descriptor.controllerName << "] Failed to query backend enabled state:" << reply.errorMessage();
+        } else {
+            bool enabled = reply.arguments().isEmpty() ? true : reply.arguments().at(0).toBool();
+            if (!enabled && isConfigEnabled) {
+                fmWarning() << "[" << m_descriptor.controllerName << "] Backend is disabled but config requires it enabled, reactivating backend";
+                activeBackend();
+            }
+        }
+        watcher->deleteLater();
+    });
 }
 
 bool AbstractIndexController::isBackendAvaliable()

@@ -21,6 +21,8 @@
 #include <dfm-base/utils/networkutils.h>
 #include <dfm-base/dfm_event_defines.h>
 #include <dfm-base/dbusservice/global_server_defines.h>
+#include <dfm-base/base/configs/dconfig/dconfigmanager.h>
+#include <dfm-base/base/configs/dconfig/global_dconf_defines.h>
 #include <dfm-base/utils/protocolutils.h>
 
 #include <dfm-io/doperator.h>
@@ -55,6 +57,8 @@ extern "C" {
 
 using namespace dfmbase;
 using namespace GlobalServerDefines;
+using namespace GlobalDConfDefines::ConfigPath;
+using namespace GlobalDConfDefines::BaseConfig;
 
 LocalFileHandler::LocalFileHandler()
     : d(new LocalFileHandlerPrivate(this))
@@ -295,6 +299,7 @@ bool LocalFileHandler::openFiles(const QList<QUrl> &fileUrls)
     QList<QUrl> pathList;
     bool result = false;
     d->invalidPath.clear();
+    d->networkUnreachablePath.clear();
 
     // Process each file
     for (const QUrl &fileUrl : fileUrls) {
@@ -858,7 +863,9 @@ bool LocalFileHandlerPrivate::openExcutableScriptFile(const QString &path, int f
     case 2: {
         QStringList args;
         args << "-e" << path;
-        result = UniversalUtils::runCommand(q->defaultTerminalPath(), args, QUrl(path).adjusted(QUrl::RemoveFilename).toString());
+        const QString workdir = QUrl(path).adjusted(QUrl::RemoveFilename).toString();
+        if (!AppLaunchUtils::instance().executeCommand(q->defaultTerminalPath(), args, QStringLiteral("shortcut"), workdir))
+            result = QProcess::startDetached(q->defaultTerminalPath(), args, workdir);
         break;
     }
     case 3:
@@ -880,7 +887,9 @@ bool LocalFileHandlerPrivate::openExcutableFile(const QString &path, int flag)
     case 1: {
         QStringList args;
         args << "-e" << path;
-        result = UniversalUtils::runCommand(q->defaultTerminalPath(), args, QUrl(path).adjusted(QUrl::RemoveFilename).toString());
+        const QString workdir = QUrl(path).adjusted(QUrl::RemoveFilename).toString();
+        if (!AppLaunchUtils::instance().executeCommand(q->defaultTerminalPath(), args, QStringLiteral("shortcut"), workdir))
+            result = QProcess::startDetached(q->defaultTerminalPath(), args, workdir);
         break;
     }
     case 2: {
@@ -1070,6 +1079,12 @@ bool LocalFileHandlerPrivate::doOpenFiles(const QList<QUrl> &urls, const QString
         const QUrl &fileUrl = url;
         const QString &filePath = fileUrl.path();
 
+        // Network check: avoid blocking GIO calls when network is down
+        if (NetworkUtils::instance()->checkFtpOrSmbBusy(fileUrl)) {
+            networkUnreachablePath << fileUrl;
+            continue;
+        }
+
         FileInfoPointer fileInfo = InfoFactory::create<FileInfo>(fileUrl);
         if (!fileInfo) {
             qCWarning(logDFMBase) << "Failed to create FileInfo for:" << fileUrl;
@@ -1214,7 +1229,7 @@ bool LocalFileHandler::renameFilesBatch(const QMap<QUrl, QUrl> &urls, QMap<QUrl,
         }
     }
 
-    qCInfo(logDFMBase, "rename Files Batch, source files count : %d, success files count : %d .\
+    qCInfo(logDFMBase, "rename Files Batch, source files count : %lld, success files count : %lld .\
           ",
            urls.count(), successUrls.count());
 
@@ -1254,6 +1269,11 @@ DFMIOErrorCode LocalFileHandler::errorCode()
 QList<QUrl> LocalFileHandler::getInvalidPath()
 {
     return d->invalidPath;
+}
+
+QList<QUrl> LocalFileHandler::getNetworkUnreachablePath()
+{
+    return d->networkUnreachablePath;
 }
 
 GlobalEventType LocalFileHandler::lastEventType()
@@ -1328,6 +1348,14 @@ std::optional<QUrl> LocalFileHandlerPrivate::resolveSymlink(const QUrl &url)
 
     QFileInfo fileInfo(currentPath);
     while (fileInfo.isSymLink()) {
+        // Use readlink (non-blocking) to get symlink target; QFileInfo::symLinkTarget()
+        // internally calls statx which follows the symlink and blocks on stale SMB mounts
+        QString symLinkTarget = FileUtils::symlinkTarget(QUrl::fromLocalFile(fileInfo.filePath()));
+        if (!symLinkTarget.isEmpty() && NetworkUtils::instance()->checkFtpOrSmbBusy(QUrl::fromLocalFile(symLinkTarget))) {
+            networkUnreachablePath << url;
+            return std::nullopt;
+        }
+
         // Get absolute path of link target (automatically handles relative paths)
         QString canonicalPath = fileInfo.canonicalFilePath();
 
@@ -1356,13 +1384,17 @@ std::optional<QUrl> LocalFileHandlerPrivate::resolveSymlink(const QUrl &url)
 
         // Network file check
         if (NetworkUtils::instance()->checkFtpOrSmbBusy(QUrl::fromLocalFile(canonicalPath))) {
-            DialogManager::instance()->showUnableToVistDir(canonicalPath);
+            networkUnreachablePath << url;
             return std::nullopt;
         }
 
         // Check if link target exists
+        // For SMB targets, only skip the broken-link dialog when the share is
+        // unmounted (so the downstream mount/remount flow can take over).
+        // If the share is still mounted but the target is gone, the link is
+        // genuinely broken and the user should be notified.
         fileInfo.setFile(canonicalPath);
-        if (!fileInfo.exists() && !ProtocolUtils::isSMBFile(QUrl::fromLocalFile(canonicalPath))) {
+        if (!fileInfo.exists() && !DeviceUtils::isUnmountSamba(QUrl::fromLocalFile(canonicalPath))) {
             // Link is broken
             GlobalEventType dialogResult = DialogManagerInstance->showBreakSymlinkDialog(
                     QFileInfo(currentPath).fileName(),
@@ -1392,6 +1424,9 @@ bool LocalFileHandlerPrivate::handleExecutableFile(const QUrl &fileUrl, bool *re
         qCWarning(logDFMBase) << "Invalid parameters to handleExecutableFile";
         return false;
     }
+
+    if (!DConfigManager::instance()->value(kOperationsDConfName, kShowRunExec, true).toBool())
+        return false;
 
     // Handle executable scripts
     if (isExecutableScript(fileUrl.path())) {

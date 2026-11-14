@@ -27,6 +27,9 @@ FileInfoWidget::FileInfoWidget(QWidget *parent)
 
 void FileInfoWidget::initUI()
 {
+    setObjectName("DetailFileInfoWidget");
+    setAccessibleName("DetailFileInfoWidget");
+
     // Create layout once - will never be deleted
     m_gridLayout = new QGridLayout(this);
     m_gridLayout->setSpacing(0);
@@ -50,6 +53,22 @@ void FileInfoWidget::initUI()
     m_fileType = createField(tr("Type"));
     m_fileAccessTime = createField(tr("Accessed"));
     m_fileModifyTime = createField(tr("Modified"));
+
+    auto exposeFieldName = [](KeyValueLabel *field, const QString &name) {
+        field->setObjectName(name);
+        field->setAccessibleName(name);
+        field->leftWidget()->setObjectName(name + "Label");
+        field->leftWidget()->setAccessibleName(name + "Label");
+        field->rightWidget()->setObjectName(name + "Value");
+        field->rightWidget()->setAccessibleName(name + "Value");
+    };
+    exposeFieldName(m_fileName, "DetailFileName");
+    exposeFieldName(m_fileSize, "DetailFileSize");
+    exposeFieldName(m_fileViewSize, "DetailFileResolution");
+    exposeFieldName(m_fileDuration, "DetailFileDuration");
+    exposeFieldName(m_fileType, "DetailFileType");
+    exposeFieldName(m_fileAccessTime, "DetailFileAccessTime");
+    exposeFieldName(m_fileModifyTime, "DetailFileModifyTime");
 
     // Build field map for extensions
     m_fieldMap.insert(BasicFieldExpandEnum::kFileName, m_fileName);
@@ -262,6 +281,7 @@ void FileInfoWidget::fillFieldValues(const QUrl &url)
         m_fileSize->setVisible(false);   // Default hidden
         if (!info->isAttributes(OptInfoType::kIsDir) && m_fileSize->RightValue().isEmpty()) {
             m_fileSize->setVisible(true);
+            info->updateAttributes();
             m_fileSize->setRightValue(FileUtils::formatSize(info->size()),
                                       Qt::ElideNone, Qt::AlignLeft, true);
             m_fileSize->adjustHeight();

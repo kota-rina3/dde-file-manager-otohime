@@ -4,6 +4,7 @@
 
 #include "recentmanager.h"
 #include "events/recenteventcaller.h"
+#include "files/recentfileinfo.h"
 
 #include <dfm-base/base/schemefactory.h>
 #include <dfm-base/utils/universalutils.h>
@@ -37,6 +38,12 @@ DCORE_USE_NAMESPACE
 DWIDGET_USE_NAMESPACE
 DGUI_USE_NAMESPACE
 using namespace GlobalServerDefines;
+
+// Batch processing parameters: process a fixed number of pending recent items
+// per timer tick, yielding to the event loop between batches to keep the UI
+// responsive during startup when the recently-used list is large.
+static constexpr int kBatchIntervalMs = 10;   // timer tick interval (ms)
+static constexpr int kBatchSize = 50;   // items processed per tick
 
 RecentManager *RecentManager::instance()
 {
@@ -73,6 +80,9 @@ QString RecentManager::getRecentOriginPaths(const QUrl &url) const
 RecentManager::RecentManager(QObject *parent)
     : QObject(parent)
 {
+    batchTimer.setInterval(kBatchIntervalMs);
+    batchTimer.setSingleShot(false);
+    connect(&batchTimer, &QTimer::timeout, this, &RecentManager::processPendingItems);
 }
 
 RecentManager::~RecentManager()
@@ -84,20 +94,51 @@ void RecentManager::resetRecentNodes()
     auto reply = recentDBusInterce->GetItemsInfo();
     reply.waitForFinished();
     const QVariantList &topLevelList = reply.value();
+
+    // Collect all items into the pending queue first, then process them in
+    // batches via a timer so the main thread can stay responsive between
+    // batches. Previously the whole list was processed in a single
+    // synchronous for-loop, which blocked the event loop and caused the UI
+    // to freeze when the recently-used list was large.
     for (const auto &value : topLevelList) {
         QDBusArgument dbusArg = value.value<QDBusArgument>();
-
         QVariantMap map;
-        dbusArg >> map;   // 直接将QDBusArgument解包为QVariantMap
-
-        if (!map.isEmpty()) {
-            auto path = map.value(RecentProperty::kPath).toString();
-            auto href = map.value(RecentProperty::kHref).toString();
-            auto modified = map.value(RecentProperty::kModified).toLongLong();
-            onItemAdded(path, href, modified);
-        } else {
+        dbusArg >> map;
+        if (map.isEmpty()) {
             fmWarning() << "Map is empty or could not be converted from DBus argument";
+            continue;
         }
+        PendingItem item {
+            map.value(RecentProperty::kPath).toString(),
+            map.value(RecentProperty::kHref).toString(),
+            map.value(RecentProperty::kModified).toLongLong()
+        };
+        if (!item.path.isEmpty())
+            pendingItems.enqueue(item);
+    }
+
+    fmInfo() << "Queued" << pendingItems.size()
+             << "recent items for batch processing";
+
+    // Kick off batch processing. The timer fires periodically, processing a
+    // fixed number of items per tick and yielding back to the event loop in
+    // between so painting/input can be handled.
+    if (!batchTimer.isActive())
+        batchTimer.start();
+}
+
+void RecentManager::processPendingItems()
+{
+    int processed = 0;
+    while (!pendingItems.isEmpty() && processed < kBatchSize) {
+        const auto &item = pendingItems.dequeue();
+        onItemAdded(item.path, item.href, item.modified);
+        ++processed;
+    }
+
+    if (pendingItems.isEmpty()) {
+        batchTimer.stop();
+        fmInfo() << "Batch processing of recent items finished";
     }
 }
 
@@ -167,12 +208,14 @@ void RecentManager::onItemAdded(const QString &path, const QString &href, qint64
         return;
     }
 
-    fmDebug() << "Adding recent item to cache:" << url;
+    fmDebug() << "Adding recent item to cache:" << url << modified;
     RecentItem item;
     item.fileInfo = info;
     item.originPath = href;
     recentItems.insert(url, item);
-    item.fileInfo->cacheAttribute(DFMIO::DFileInfo::AttributeID::kTimeAccess, modified);
+    auto recentInfo = item.fileInfo.dynamicCast<RecentFileInfo>();
+    if (recentInfo)
+        recentInfo->setLastReadTime(QDateTime::fromSecsSinceEpoch(modified));
 
     QSharedPointer<AbstractFileWatcher> watcher = WatcherCache::instance().getCacheWatcher(RecentHelper::rootUrl());
     if (watcher)
@@ -210,8 +253,9 @@ void RecentManager::onItemChanged(const QString &path, qint64 modified)
     }
 
     fmDebug() << "Updating recent item access time - path:" << path << "timestamp:" << modified;
-    QDateTime dateTime { QDateTime::fromSecsSinceEpoch(modified) };
-    recentItems[url].fileInfo->cacheAttribute(DFMIO::DFileInfo::AttributeID::kTimeAccess, modified);
+    auto recentInfo = recentItems[url].fileInfo.dynamicCast<RecentFileInfo>();
+    if (recentInfo)
+        recentInfo->setLastReadTime(QDateTime::fromSecsSinceEpoch(modified));
 
     QSharedPointer<AbstractFileWatcher> watcher = WatcherCache::instance().getCacheWatcher(RecentHelper::rootUrl());
     if (watcher)

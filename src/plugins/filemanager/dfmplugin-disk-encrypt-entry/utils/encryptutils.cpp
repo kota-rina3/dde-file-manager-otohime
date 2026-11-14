@@ -21,6 +21,8 @@
 #include <QJsonDocument>
 #include <QDir>
 #include <QApplication>
+#include <QStorageInfo>
+#include <QFileInfo>
 #include <QFutureWatcher>
 #include <QtConcurrent>
 
@@ -30,6 +32,7 @@
 #include <fstab.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <cerrno>
 
 Q_DECLARE_METATYPE(bool *)
@@ -59,21 +62,36 @@ QString config_utils::cipherType()
     return cipher;
 }
 
-int tpm_utils::checkTPM()
+int tpm_utils::checkTPM(bool *authFailed)
 {
-    CREATE_TPM_INTERFACE(iface);
+    if (authFailed)
+        *authFailed = false;
+
+    QDBusInterface iface(kTPMControlService, kTPMControlPath, kTPMControlInterface, QDBusConnection::systemBus());
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmWarning() << "TPMControl DBus interface is invalid, service may be unavailable";
         return -1;
     }
 
     QDBusReply<int> reply = iface.call("IsTPMAvailable");
-    return reply.isValid() ? reply.value() : -1;
+    if (!reply.isValid()) {
+        fmWarning() << "IsTPMAvailable DBus call failed";
+        return -1;
+    }
+
+    int ret = reply.value();
+    // A valid reply carrying -1 means the service side returned kAuthFailed
+    // (PolicyKit authorization failed/cancelled by user).
+    if (authFailed)
+        *authFailed = (ret == -1);
+    return ret;
 }
 
 int tpm_utils::checkTPMLockoutStatus()
 {
-    CREATE_TPM_INTERFACE(iface);
+    QDBusInterface iface(kTPMControlService, kTPMControlPath, kTPMControlInterface, QDBusConnection::systemBus());
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmWarning() << "TPMControl DBus interface is invalid, service may be unavailable";
         return -1;
@@ -85,7 +103,8 @@ int tpm_utils::checkTPMLockoutStatus()
 
 int tpm_utils::getRandomByTPM(int size, QString *output)
 {
-    CREATE_TPM_INTERFACE(iface);
+    QDBusInterface iface(kTPMControlService, kTPMControlPath, kTPMControlInterface, QDBusConnection::systemBus());
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmWarning() << "TPMControl DBus interface is invalid, service may be unavailable";
         return -1;
@@ -143,7 +162,8 @@ int tpm_utils::getRandomByTPM(int size, QString *output)
 
 int tpm_utils::isSupportAlgoByTPM(const QString &algoName, bool *support)
 {
-    CREATE_TPM_INTERFACE(iface);
+    QDBusInterface iface(kTPMControlService, kTPMControlPath, kTPMControlInterface, QDBusConnection::systemBus());
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmWarning() << "TPMControl DBus interface is invalid, service may be unavailable";
         return -1;
@@ -168,7 +188,8 @@ int tpm_utils::isSupportAlgoByTPM(const QString &algoName, bool *support)
 
 int tpm_utils::encryptByTPM(const QVariantMap &map)
 {
-    CREATE_TPM_INTERFACE(iface);
+    QDBusInterface iface(kTPMControlService, kTPMControlPath, kTPMControlInterface, QDBusConnection::systemBus());
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmWarning() << "TPMControl DBus interface is invalid, service may be unavailable";
         return -1;
@@ -211,7 +232,8 @@ int tpm_utils::encryptByTPM(const QVariantMap &map)
 
 int tpm_utils::decryptByTPM(const QVariantMap &map, QString *psw)
 {
-    CREATE_TPM_INTERFACE(iface);
+    QDBusInterface iface(kTPMControlService, kTPMControlPath, kTPMControlInterface, QDBusConnection::systemBus());
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmWarning() << "TPMControl DBus interface is invalid, service may be unavailable";
         return -1;
@@ -300,7 +322,8 @@ int tpm_utils::decryptByTPM(const QVariantMap &map, QString *psw)
 
 int tpm_utils::ownerAuthStatus()
 {
-    CREATE_TPM_INTERFACE(iface);
+    QDBusInterface iface(kTPMControlService, kTPMControlPath, kTPMControlInterface, QDBusConnection::systemBus());
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmWarning() << "TPMControl DBus interface is invalid, service may be unavailable";
         return -1;
@@ -313,6 +336,7 @@ int tpm_utils::ownerAuthStatus()
 int device_utils::encKeyType(const QString &dev)
 {
     CREATE_DAEMON_INTERFACE(iface);
+    iface.setTimeout(kTPMDBusTimeoutMs);
     if (!iface.isValid()) {
         fmWarning() << "Failed to create DBus interface for TpmToken, service may be unavailable";
         return 0;
@@ -547,12 +571,240 @@ QString recovery_key_utils::formatRecoveryKey(const QString &raw)
     return formatted;
 }
 
+bool recovery_key_utils::validateExportPath(const QString &path, const QString &targetDevice, QString *msg)
+{
+    auto setMsg = [&](const QString &info) { if (msg) *msg = info; };
+
+    if (path.isEmpty()) {
+        setMsg(QObject::tr("Recovery key export path cannot be empty!"));
+        return false;
+    }
+
+    if (!QDir(path).exists()) {
+        fmWarning() << "Export path does not exist:" << path;
+        setMsg(QObject::tr("Recovery key export path is not exists!"));
+        return false;
+    }
+
+    int dirFd = ::open(path.toLocal8Bit().constData(), O_PATH | O_NOFOLLOW | O_DIRECTORY);
+    if (dirFd < 0) {
+        fmWarning() << "Export path is a symlink or not a directory:" << path;
+        setMsg(QObject::tr("Recovery key export path cannot be a symlink or non-directory!"));
+        return false;
+    }
+
+    struct stat dirStat;
+    if (::fstat(dirFd, &dirStat) != 0) {
+        ::close(dirFd);
+        fmWarning() << "Cannot stat export path directory:" << path;
+        setMsg(QObject::tr("Cannot access the export path directory!"));
+        return false;
+    }
+    if (dirStat.st_mode & S_IWOTH) {
+        ::close(dirFd);
+        fmWarning() << "Export path directory is world-writable:" << path;
+        setMsg(QObject::tr("This directory can be written by other users, please choose a safer directory!"));
+        return false;
+    }
+    if (::faccessat(dirFd, ".", W_OK, 0) != 0) {
+        ::close(dirFd);
+        fmWarning() << "Export path directory is not writable:" << path;
+        setMsg(QObject::tr("The export path directory is not writable, please choose a writable directory!"));
+        return false;
+    }
+    ::close(dirFd);
+
+    QStorageInfo storage(path);
+    if (storage.isReadOnly()) {
+        fmWarning() << "Export path is read-only:" << path;
+        setMsg(QObject::tr("This partition is read-only, please export to a writable partition"));
+        return false;
+    }
+
+    if (!targetDevice.isEmpty()) {
+        QString dev = storage.device();
+        QStringList associatedDevs { dev };
+        if (dev.startsWith("/dev/mapper/")) {
+            QFileInfo f(dev);
+            if (f.isSymbolicLink()) {
+                auto linkDev = f.symLinkTarget();
+                if (!linkDev.isEmpty()) {
+                    CREATE_DAEMON_INTERFACE(iface);
+                    if (iface.isValid()) {
+                        QDBusReply<QString> reply = iface.call("HolderDevice", linkDev);
+                        if (reply.isValid())
+                            associatedDevs.append(reply.value());
+                        else
+                            associatedDevs.append(linkDev);
+                    } else {
+                        associatedDevs.append(linkDev);
+                    }
+                }
+            }
+        }
+        if (associatedDevs.contains(targetDevice)) {
+            fmWarning() << "Export path is on the same device being encrypted:" << targetDevice;
+            setMsg(QObject::tr("Please export to an external device such as a non-encrypted partition or USB flash drive."));
+            return false;
+        }
+    }
+
+    using namespace dfmmount;
+    auto monitor = DDeviceManager::instance()->getRegisteredMonitor(DeviceType::kBlockDevice).objectCast<DBlockMonitor>();
+    Q_ASSERT(monitor);
+    auto devObjPaths = monitor->resolveDeviceNode(storage.device(), {});
+    if (!devObjPaths.isEmpty()) {
+        auto objPath = devObjPaths.constFirst();
+        auto devPtr = monitor->createDeviceById(objPath);
+        if (devPtr && devPtr->getProperty(Property::kBlockCryptoBackingDevice).toString() != "/") {
+            fmWarning() << "Export path is on an encrypted partition:" << path;
+            setMsg(QObject::tr("The partition is encrypted, please export to a non-encrypted "
+                              "partition or external device such as a USB flash drive."));
+            return false;
+        }
+    }
+
+    return true;
+}
+
 BlockDev device_utils::createBlockDevice(const QString &devObjPath)
 {
     using namespace dfmmount;
     auto monitor = DDeviceManager::instance()->getRegisteredMonitor(DeviceType::kBlockDevice).objectCast<DBlockMonitor>();
     Q_ASSERT(monitor);
     return monitor->createDeviceById(devObjPath).objectCast<DBlockDevice>();
+}
+
+/*!
+ * \brief Encode a block device name to UDisks2 object path format.
+ *
+ * UDisks2 encodes characters that are not [a-zA-Z0-9] as _<hex> in object paths.
+ * For example, "dm-2" becomes "dm_2d2" (- is 0x2d).
+ */
+static QString encodeBlockDevName(const QString &devName)
+{
+    QString encoded;
+    for (const auto &ch : devName) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+            encoded.append(ch);
+        } else {
+            encoded.append(QString("_%1").arg(static_cast<int>(ch.unicode()), 2, 16, QChar('0')));
+        }
+    }
+    return encoded;
+}
+
+/*!
+ * \brief Traverse the sysfs holder chain to find the top DM device.
+ *
+ * For overlay encryption: nvme0n1p5 -> dm-0 (mid) -> dm-2 (top).
+ * The traversal stops at the first device that has no DM holders.
+ *
+ * \param device The physical device path (e.g., /dev/nvme0n1p5)
+ * \param devName The device name without /dev/ prefix (e.g., nvme0n1p5)
+ * \return The top DM device path, or the original device if no holders found.
+ */
+static QString traverseHolderChain(const QString &device, const QString &devName)
+{
+    static const QRegularExpression kValidDevName("^[a-zA-Z0-9_-]+$");
+
+    QString currentDev = device;
+    QString currentName = devName;
+
+    while (true) {
+        QString holdersPath = QString("/sys/class/block/%1/holders").arg(currentName);
+        QDir holdersDir(holdersPath);
+        if (!holdersDir.exists())
+            break;
+
+        auto holders = holdersDir.entryList(QDir::AllEntries | QDir::NoDotAndDotDot);
+        if (holders.isEmpty())
+            break;
+
+        // Find the first DM holder (defense in depth: also validate kernel-provided names)
+        QString nextDm;
+        for (const auto &h : holders) {
+            if (h.startsWith("dm-") && kValidDevName.match(h).hasMatch()) {
+                nextDm = h;
+                break;
+            }
+        }
+        if (nextDm.isEmpty())
+            break;
+
+        fmDebug() << "Found DM holder:" << nextDm << "for device:" << currentDev;
+        currentDev = "/dev/" + nextDm;
+        currentName = nextDm;
+    }
+
+    if (currentDev == device) {
+        fmDebug() << "No DM holder found for device, using original:" << device;
+    } else {
+        fmInfo() << "Resolved top DM device:" << currentDev << "from physical device:" << device;
+    }
+
+    return currentDev;
+}
+
+/*!
+ * \brief Resolve a device path to its UDisks2 entry URL path component.
+ *
+ * Uses the block monitor's resolveDeviceNode to get the canonical UDisks2
+ * object path, then strips the prefix and appends ".blockdev".
+ *
+ * \param currentDev The device path to resolve (e.g., /dev/dm-2)
+ * \param currentName The device name for fallback encoding (e.g., dm-2)
+ * \return The entry URL path (e.g., dm_2d2.blockdev), or empty string on failure.
+ */
+static QString resolveToEntryPath(const QString &currentDev, const QString &currentName)
+{
+    using namespace dfmmount;
+    auto monitor = DDeviceManager::instance()->getRegisteredMonitor(DeviceType::kBlockDevice).objectCast<DBlockMonitor>();
+    if (monitor) {
+        auto objPaths = monitor->resolveDeviceNode(currentDev, {});
+        if (!objPaths.isEmpty()) {
+            static constexpr char kBlockDeviceIdPrefix[] { "/org/freedesktop/UDisks2/block_devices/" };
+            QString shortName = objPaths.first();
+            shortName.remove(kBlockDeviceIdPrefix);
+            QString entryPath = QString("%1.blockdev").arg(shortName);
+            fmInfo() << "Resolved entry block dev path:" << entryPath << "from device:" << currentDev;
+            return entryPath;
+        }
+        fmWarning() << "resolveDeviceNode returned empty for:" << currentDev;
+    } else {
+        fmWarning() << "Failed to get block device monitor";
+    }
+
+    // Fallback: manually encode the device name
+    QString encodedName = encodeBlockDevName(currentName);
+    QString entryPath = QString("%1.blockdev").arg(encodedName);
+    fmInfo() << "Using fallback encoding for entry block dev path:" << entryPath << "from device:" << currentDev;
+    return entryPath;
+}
+
+QString device_utils::resolveEntryBlockDevPath(const QString &device)
+{
+    if (device.isEmpty()) {
+        fmWarning() << "Device path is empty, cannot resolve entry block dev path";
+        return QString();
+    }
+
+    // Extract device name from path (e.g., "/dev/nvme0n1p5" -> "nvme0n1p5")
+    QString devName = device;
+    if (devName.startsWith("/dev/"))
+        devName = devName.mid(5);
+
+    // Validate device name to prevent directory traversal attacks.
+    // Block device names only contain alphanumeric characters, hyphens, and underscores.
+    // This rejects inputs like "../../etc" that could escape /sys/class/block/.
+    static const QRegularExpression kValidDevName("^[a-zA-Z0-9_-]+$");
+    if (!kValidDevName.match(devName).hasMatch()) {
+        fmWarning() << "Invalid device name, potential path traversal detected:" << devName;
+        return QString();
+    }
+
+    QString currentDev = traverseHolderChain(device, devName);
+    return resolveToEntryPath(currentDev, currentDev.startsWith("/dev/") ? currentDev.mid(5) : currentDev);
 }
 
 int dialog_utils::showDialog(const QString &title, const QString &msg)

@@ -18,7 +18,7 @@ typedef QSharedPointer<dfmmount::DBlockDevice> BlockDev;
 namespace dfmplugin_diskenc {
 
 namespace tpm_utils {
-int checkTPM();
+int checkTPM(bool *authFailed = nullptr);
 int checkTPMLockoutStatus();
 int getRandomByTPM(int size, QString *output);
 int isSupportAlgoByTPM(const QString &algoName, bool *support);
@@ -76,12 +76,26 @@ bool useOverlayDMMode();
 
 namespace recovery_key_utils {
 QString formatRecoveryKey(const QString &raw);
+bool validateExportPath(const QString &path, const QString &targetDevice, QString *msg = nullptr);
 }
 
 namespace device_utils {
 int encKeyType(const QString &dev);
 void cacheToken(const QString &device, const QVariantMap &token);
 BlockDev createBlockDevice(const QString &devObjPath);
+
+/*!
+ * \brief Resolve the entry URL block device path from a physical device path.
+ *
+ * For overlay encryption, the physical partition (e.g., /dev/nvme0n1p5) has
+ * DM device holders in sysfs. This function traverses the holder chain to
+ * find the top DM device, then resolves its UDisks2 object path to construct
+ * the entry URL path (e.g., dm_2d2.blockdev).
+ *
+ * \param device The physical device path (e.g., /dev/nvme0n1p5)
+ * \return The entry URL path (e.g., dm_2d2.blockdev), or empty string on failure.
+ */
+QString resolveEntryBlockDevPath(const QString &device);
 }   // namespace device_utils
 
 namespace dialog_utils {

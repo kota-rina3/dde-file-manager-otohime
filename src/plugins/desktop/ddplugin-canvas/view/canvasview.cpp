@@ -35,6 +35,8 @@ using namespace GlobalDConfDefines::BaseConfig;
 CanvasView::CanvasView(QWidget *parent)
     : QAbstractItemView(parent), d(new CanvasViewPrivate(this))
 {
+    setObjectName("dd_canvas_view");
+    setAccessibleName("dd_canvas_view");
 }
 
 QRect CanvasView::visualRect(const QModelIndex &index) const
@@ -46,6 +48,19 @@ QRect CanvasView::visualRect(const QModelIndex &index) const
 
     // the index is not on this.
     return QRect();
+}
+
+QRect CanvasView::iconRect(const QUrl &url) const
+{
+    // The grid is authoritative for the item geometry (the model may be empty
+    // on Treeland, where the desktop shell provides the data through a hook).
+    QPair<int, QPoint> pos;
+    if (!GridIns->point(url.toString(), pos) || pos.first != d->screenNum)
+        return QRect();
+
+    // Mirror the paint geometry: strip the grid margins around the item, then
+    // the delegate derives the icon cell from the remainder.
+    return itemDelegate()->iconRect(d->itemRect(pos.second));
 }
 
 void CanvasView::scrollTo(const QModelIndex &index, QAbstractItemView::ScrollHint hint)
@@ -566,27 +581,6 @@ void CanvasView::showGrid(bool v) const
     d->showGrid = v;
 }
 
-void CanvasView::aboutToResortFiles()
-{
-    if (!d->sortAnimOper)
-        return;
-
-    QStringList existItems;
-    const QList<QUrl> &actualList = model()->files();
-    for (const QUrl &df : actualList)
-        existItems.append(df.toString());
-
-    d->sortAnimOper->setMoveValue(existItems);
-}
-
-void CanvasView::filesResorted()
-{
-    if (!d->sortAnimOper)
-        return;
-
-    d->sortAnimOper->tryMove();
-}
-
 void CanvasView::refresh(bool silent)
 {
     fmDebug() << "Refreshing canvas view - silent:" << silent;
@@ -831,7 +825,7 @@ CanvasViewPrivate::CanvasViewPrivate(CanvasView *qq)
 
     dragDropOper = new DragDropOper(q);
     dodgeOper = new DodgeOper(q);
-    sortAnimOper = new SortAnimationOper(q);
+    sortAnimOper = SortAnimationOper::instance();
     shortcutOper = new ShortcutOper(q);
     menuProxy = new CanvasViewMenuProxy(q);
     viewSetting = new ViewSettingUtil(q);

@@ -17,6 +17,11 @@
 
 #include <QDebug>
 #include <QUrl>
+#include <QtConcurrent>
+#include <QFutureWatcher>
+
+#include <DConfig>
+#include <dfm-base/utils/windowutils.h>
 
 using namespace dfmplugin_trashcore;
 DFMBASE_USE_NAMESPACE
@@ -49,17 +54,34 @@ void TrashCoreEventSender::initTrashWatcher()
 
 bool TrashCoreEventSender::checkAndStartWatcher()
 {
-    if (NetworkUtils::instance()->checkAllCIFSBusy()) {
-        timer.start();
+    if (cifsCheckInProgress)
         return false;
-    }
 
-    if (!trashFileWatcher->startWatcher()) {
-        timer.start();
-        return false;
-    }
+    cifsCheckInProgress = true;
+    auto *watcher = new QFutureWatcher<bool>(this);
+    connect(watcher, &QFutureWatcher<bool>::finished, this, [this, watcher]() {
+        cifsCheckInProgress = false;
+        bool cifsBusy = watcher->result();
+        watcher->deleteLater();
 
-    return true;
+        if (cifsBusy) {
+            timer.start();
+            return;
+        }
+
+        if (!trashFileWatcher->startWatcher()) {
+            timer.start();
+            return;
+        }
+
+        watcherInitialized = true;
+        initTrashState();
+    });
+    watcher->setFuture(QtConcurrent::run([]() {
+        return NetworkUtils::instance()->checkAllCIFSBusy();
+    }));
+
+    return false;
 }
 
 TrashCoreEventSender *TrashCoreEventSender::instance()
@@ -90,6 +112,8 @@ void TrashCoreEventSender::initTrashState()
 
     // Startup defaults to the non-empty icon, so only an empty result needs
     // an immediate correction signal.
+    syncTrashIconToAM(actuallyEmpty);
+
     if (trashState == TrashState::Empty)
         dpfSignalDispatcher->publish("dfmplugin_trashcore", "signal_TrashCore_TrashStateChanged");
 }
@@ -109,6 +133,7 @@ void TrashCoreEventSender::sendTrashStateChangedDel()
         if (trashState == TrashState::Empty) {
             qInfo() << "TrashCore: Trash became empty, sending state changed signal";
             dpfSignalDispatcher->publish("dfmplugin_trashcore", "signal_TrashCore_TrashStateChanged");
+            syncTrashIconToAM(true);
         }
     }
 }
@@ -121,6 +146,27 @@ void TrashCoreEventSender::sendTrashStateChangedAdd()
         trashState = TrashState::NotEmpty;
         qInfo() << "TrashCore: Trash became non-empty, sending state changed signal";
         dpfSignalDispatcher->publish("dfmplugin_trashcore", "signal_TrashCore_TrashStateChanged");
+        syncTrashIconToAM(false);
     }
     // If trash was already not empty, no state change occurred, no signal needed
+}
+
+void TrashCoreEventSender::syncTrashIconToAM(bool empty)
+{
+    const QString subpath = WindowUtils::isWayLand()
+            ? QStringLiteral("/dde-trash/wayland")
+            : QStringLiteral("/dde-trash/x11");
+
+    auto config = Dtk::Core::DConfig::create(
+            "org.deepin.dde.application-manager",
+            "org.deepin.dde.am.appoverride",
+            subpath, this);
+
+    if (!config || !config->isValid()) {
+        fmWarning() << "TrashCore: failed to create AM appoverride DConfig for" << subpath;
+        return;
+    }
+
+    config->setValue("Icon", empty ? QStringLiteral("user-trash")
+                                    : QStringLiteral("user-trash-full"));
 }

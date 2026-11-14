@@ -139,6 +139,7 @@ void ItemEditor::showAlertMessage(const QString &text, int duration)
 DArrowRectangle *ItemEditor::createTooltip()
 {
     auto tooltip = new DArrowRectangle(DArrowRectangle::ArrowTop);
+    tooltip->setAccessibleName("Tooltip");
     tooltip->setObjectName("AlertTooltip");
 
     QLabel *label = new QLabel(tooltip);
@@ -202,6 +203,8 @@ void ItemEditor::setOpacity(qreal opacity)
 RenameEdit *ItemEditor::createEditor()
 {
     auto edit = new RenameEdit();
+    edit->setObjectName("RenameEdit_2");
+    edit->setAccessibleName("RenameEdit_2");
     edit->setWordWrapMode(QTextOption::WrapAnywhere);
     edit->setAlignment(Qt::AlignHCenter);
     edit->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);

@@ -9,6 +9,7 @@
 #include "workers/cryptworkers.h"
 #include "helpers/jobfilehelper.h"
 #include "helpers/notificationhelper.h"
+#include "helpers/overlaydmnotifyhelper.h"
 #include "helpers/crypttabhelper.h"
 #include "helpers/commonhelper.h"
 #include "helpers/filesystemhelper.h"
@@ -24,15 +25,20 @@
 #include <QFutureWatcher>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QProcess>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 #include <polkit-qt6-1/PolkitQt1/Authority>
 
 #include <unistd.h>
+#include <errno.h>
 
 static constexpr char kActionEncrypt[] { "org.deepin.Filemanager.DiskEncrypt.Encrypt" };
 static constexpr char kActionDecrypt[] { "org.deepin.Filemanager.DiskEncrypt.Decrypt" };
 static constexpr char kActionChgPwd[] { "org.deepin.Filemanager.DiskEncrypt.ChangePassphrase" };
+static constexpr char kActionChgPIN[] { "org.deepin.Filemanager.DiskEncrypt.ChangePIN" };
 
 FILE_ENCRYPT_USE_NS
 
@@ -161,15 +167,35 @@ bool DiskEncryptSetup::ChangePassphrase(const QDBusUnixFileDescriptor &credentia
 {
     qInfo() << "[DiskEncryptSetup::ChangePassphrase] Passphrase change request received via fd";
 
-    if (!m_dptr->checkAuth(kActionChgPwd)) {
-        qWarning() << "[DiskEncryptSetup::ChangePassphrase] Authentication failed for passphrase change action";
-        return false;
-    }
-
-    // Parse credentials from fd using common method
+    // Parse credentials first to determine the encryption type for the correct polkit action
     QVariantMap args;
     if (!m_dptr->parseCredentialsFromFd(credentialsFd, &args)) {
         qCritical() << "[DiskEncryptSetup::ChangePassphrase] Failed to parse credentials from fd";
+        return false;
+    }
+
+    // Determine the security key type to select the appropriate polkit action.
+    // The server independently infers secType from the device's TPM token
+    // (via TpmToken, which includes holder-device fallback) rather than
+    // trusting client-supplied input for the authorization decision.
+    auto dev = args.value(disk_encrypt::encrypt_param_keys::kKeyDevice).toString();
+    QString token = TpmToken(dev);
+    QString usePin;
+    if (!token.isEmpty()) {
+        QJsonParseError parseError;
+        QJsonDocument doc = QJsonDocument::fromJson(token.toLocal8Bit(), &parseError);
+        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+            qWarning() << "[DiskEncryptSetup::ChangePassphrase] Failed to parse TPM token JSON for device:" << dev << "Error:" << parseError.errorString();
+            return false;
+        }
+        QJsonObject obj = doc.object();
+        usePin = obj.value("pin").toString("");
+    }
+    auto secType = (usePin == "1") ? disk_encrypt::kPin : disk_encrypt::kPwd;
+    const QString &action = (secType == disk_encrypt::kPin) ? kActionChgPIN : kActionChgPwd;
+
+    if (!m_dptr->checkAuth(action)) {
+        qWarning() << "[DiskEncryptSetup::ChangePassphrase] Authentication failed for passphrase change action";
         return false;
     }
 
@@ -281,16 +307,25 @@ QString DiskEncryptSetup::PendingDecryptionDevice()
     for (auto f : files) {
         auto name = m_dptr->resolveDeviceByDetachHeaderName(f);
         if (!name.isEmpty()) {
-            // Validate that the device is still encrypted; if it has been reformatted
-            // (e.g. via mke2fs), the LUKS header is gone and this backup file is stale.
-            auto status = crypt_setup_helper::encryptStatus(name);
-            if (status == disk_encrypt::kStatusNotEncrypted || status < 0) {
-                qInfo() << "[DiskEncryptSetup::PendingDecryptionDevice] Device is no longer encrypted, removing stale backup:"
-                         << name << "file:" << f;
-                QFile::remove(d.absoluteFilePath(f));
+            // Judge staleness by the backup header file itself, not by the device's
+            // own LUKS state: during an interrupted offline decrypt the on-disk LUKS
+            // header is already detached/rewritten, so the device no longer reports
+            // crypto_LUKS even though the decrypt is still in progress. The backup
+            // header is the only source for resuming the decrypt and must be kept
+            // unless headerStatus confirms the decrypt has fully completed.
+            //
+            // headerStatus is a best-effort heuristic (readLine-at-4096 JSON parse)
+            // and may return kInvalidHeader even for a valid interrupted-decrypt
+            // backup. Only delete when it definitively reports kDecryptFully.
+            const QString &backupPath = d.absoluteFilePath(f);
+            int hs = crypt_setup_helper::headerStatus(backupPath);
+            if (hs == crypt_setup_helper::kDecryptFully) {
+                qInfo() << "[DiskEncryptSetup::PendingDecryptionDevice] Backup header indicates the decrypt has fully completed, removing stale backup:"
+                         << name << "file:" << f << "headerStatus:" << hs;
+                QFile::remove(backupPath);
                 continue;
             }
-            qInfo() << "[DiskEncryptSetup::PendingDecryptionDevice] Found pending decryption device:" << name << "from header file:" << f;
+            qInfo() << "[DiskEncryptSetup::PendingDecryptionDevice] Found pending decryption device:" << name << "from header file:" << f << "headerStatus:" << hs;
             return name;
         }
     }
@@ -359,6 +394,7 @@ void DiskEncryptSetupPrivate::resumeEncryption(const QVariantMap &args)
             qptr, &DiskEncryptSetup::WaitAuthInput);
     connect(worker, &QThread::finished,
             this, &DiskEncryptSetupPrivate::onResumeEncryptFinished);
+    qDebug() << "[DiskEncryptSetupPrivate::resumeEncryption] start resumeEncryption";
     worker->start();
 }
 
@@ -516,7 +552,10 @@ void DiskEncryptSetupPrivate::initThreadConnection(const QThread *thread)
 void DiskEncryptSetupPrivate::onInitEncryptFinished()
 {
     auto worker = dynamic_cast<BaseEncryptWorker *>(sender());
-    if (!worker) return;
+    if (!worker) {
+        qCritical() << "[DiskEncryptSetupPrivate::onInitEncryptFinished] the worker is nullptr, so return";
+        return;
+    }
     worker->deleteLater();
 
     auto args = worker->args();
@@ -553,8 +592,11 @@ void DiskEncryptSetupPrivate::onResumeEncryptFinished()
                                 { kKeyDeviceName, args.value(kKeyDeviceName).toString() },
                                 { kKeyOperationResult, code } };
 
-    // save failed, ask front to save it again.
-    if (code == -disk_encrypt::KErrorRequestExportRecKey)
+    // The service always returns the recovery key (when one was generated) to the
+    // front-end. Writing the recovery key file to the user-selected export path is
+    // now done by the front-end in the user session, because the hardened service
+    // (PrivateTmp/ProtectHome) can no longer write to user-selected directories.
+    if (!worker->recoveryKey().isEmpty())
         result.insert(kKeyRecoveryKey, worker->recoveryKey());
 
     Q_EMIT qptr->EncryptResult(result);
@@ -646,10 +688,19 @@ bool DiskEncryptSetupPrivate::handleOverlayDMModeChange(bool enabled)
 {
     qInfo() << "[DiskEncryptSetupPrivate::handleOverlayDMModeChange] Handling mode change, enabled:" << enabled;
 
+    // Create pending marker to detect interrupted operations on next startup.
+    // The marker is removed on every exit path below; if the process is killed
+    // mid-operation the marker survives and syncConfigWithFileSystem() rolls back.
+    if (!createOverlayDMPendingFile()) {
+        qCritical() << "[DiskEncryptSetupPrivate::handleOverlayDMModeChange] Failed to create pending marker";
+        return false;
+    }
+
     if (enabled) {
         // Create flag file
         if (!createOverlayDMFlagFile()) {
             qCritical() << "[DiskEncryptSetupPrivate::handleOverlayDMModeChange] Failed to create overlay DM flag file";
+            removeOverlayDMPendingFile();
             return false;
         }
 
@@ -666,15 +717,18 @@ bool DiskEncryptSetupPrivate::handleOverlayDMModeChange(bool enabled)
                 config->setValue("useOverlayDMMode", false);
                 qInfo() << "[DiskEncryptSetupPrivate::handleOverlayDMModeChange] Config value rolled back to false";
             }
+            removeOverlayDMPendingFile();
             return false;
         }
 
         qInfo() << "[DiskEncryptSetupPrivate::handleOverlayDMModeChange] Overlay DM mode enabled successfully";
+        removeOverlayDMPendingFile();
         return true;
     } else {
         // Disable mode: remove flag file
         if (!removeOverlayDMFlagFile()) {
             qCritical() << "[DiskEncryptSetupPrivate::handleOverlayDMModeChange] Failed to remove overlay DM flag file";
+            removeOverlayDMPendingFile();
             return false;
         }
 
@@ -691,69 +745,100 @@ bool DiskEncryptSetupPrivate::handleOverlayDMModeChange(bool enabled)
                 config->setValue("useOverlayDMMode", true);
                 qInfo() << "[DiskEncryptSetupPrivate::handleOverlayDMModeChange] Config value rolled back to true";
             }
+            removeOverlayDMPendingFile();
             return false;
         }
 
         qInfo() << "[DiskEncryptSetupPrivate::handleOverlayDMModeChange] Overlay DM mode disabled successfully";
+        removeOverlayDMPendingFile();
         return true;
     }
 }
 
-bool DiskEncryptSetupPrivate::createOverlayDMFlagFile()
+bool DiskEncryptSetupPrivate::createMarkerFile(const QString &path)
 {
-    static constexpr char kSettingsDir[] { "/etc/usec-crypt/settings" };
-    static constexpr char kFlagFile[] { "/etc/usec-crypt/settings/overlay-dm" };
+    qInfo() << "[DiskEncryptSetupPrivate::createMarkerFile] Creating marker file:" << path;
 
-    qInfo() << "[DiskEncryptSetupPrivate::createOverlayDMFlagFile] Creating overlay DM flag file";
-
-    // Create directory if not exists
-    QDir dir(kSettingsDir);
+    // Create directory if not exists, with owner-only permissions
+    QDir dir(disk_encrypt::kOverlayDMSettingsDir);
     if (!dir.exists()) {
-        if (!dir.mkpath(kSettingsDir)) {
-            qCritical() << "[DiskEncryptSetupPrivate::createOverlayDMFlagFile] Failed to create settings directory:" << kSettingsDir;
+        if (!dir.mkpath(disk_encrypt::kOverlayDMSettingsDir)) {
+            qCritical() << "[DiskEncryptSetupPrivate::createMarkerFile] Failed to create settings directory:" << disk_encrypt::kOverlayDMSettingsDir;
             return false;
         }
-        qInfo() << "[DiskEncryptSetupPrivate::createOverlayDMFlagFile] Settings directory created:" << kSettingsDir;
+        qInfo() << "[DiskEncryptSetupPrivate::createMarkerFile] Settings directory created:" << disk_encrypt::kOverlayDMSettingsDir;
     }
 
-    // Create empty flag file
-    QFile file(kFlagFile);
-    if (file.exists()) {
-        qInfo() << "[DiskEncryptSetupPrivate::createOverlayDMFlagFile] Flag file already exists:" << kFlagFile;
-        return true;
-    }
-
-    if (!file.open(QIODevice::WriteOnly)) {
-        qCritical() << "[DiskEncryptSetupPrivate::createOverlayDMFlagFile] Failed to create flag file:" << kFlagFile
+    // Create empty marker file (NewOnly = O_CREAT|O_EXCL, prevents symlink attacks / TOCTOU)
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
+        if (QFile::exists(path)) {
+            qInfo() << "[DiskEncryptSetupPrivate::createMarkerFile] Marker file already exists:" << path;
+            return true;
+        }
+        qCritical() << "[DiskEncryptSetupPrivate::createMarkerFile] Failed to create marker file:" << path
                     << "Error:" << file.errorString();
         return false;
     }
 
     file.close();
-    qInfo() << "[DiskEncryptSetupPrivate::createOverlayDMFlagFile] Flag file created successfully:" << kFlagFile;
+    qInfo() << "[DiskEncryptSetupPrivate::createMarkerFile] Marker file created successfully:" << path;
+    return true;
+}
+
+bool DiskEncryptSetupPrivate::createOverlayDMFlagFile()
+{
+    return createMarkerFile(disk_encrypt::kOverlayDMFlagFile);
+}
+
+bool DiskEncryptSetupPrivate::createOverlayDMPendingFile()
+{
+    return createMarkerFile(disk_encrypt::kOverlayDMPendingFile);
+}
+
+bool DiskEncryptSetupPrivate::removeMarkerFile(const QString &path)
+{
+    qInfo() << "[DiskEncryptSetupPrivate::removeMarkerFile] Removing marker file:" << path;
+
+    QFileInfo fileInfo(path);
+    if (!fileInfo.exists()) {
+        qInfo() << "[DiskEncryptSetupPrivate::removeMarkerFile] Marker file does not exist:" << path;
+        return true;
+    }
+
+    // Security check: if the file is a symlink, it may have been tampered with
+    // to point to a critical system file. Use ::unlink() which removes only the
+    // directory entry (the symlink itself), never the target file.
+    if (fileInfo.isSymLink()) {
+        qWarning() << "[DiskEncryptSetupPrivate::removeMarkerFile] Marker is a symlink (possible tampering), removing link only:" << path;
+        if (::unlink(fileInfo.absoluteFilePath().toUtf8().constData()) != 0) {
+            qCritical() << "[DiskEncryptSetupPrivate::removeMarkerFile] Failed to unlink symlink:" << path
+                        << "errno:" << errno;
+            return false;
+        }
+        qInfo() << "[DiskEncryptSetupPrivate::removeMarkerFile] Symlink removed:" << path;
+        return true;
+    }
+
+    QFile file(path);
+    if (!file.remove()) {
+        qCritical() << "[DiskEncryptSetupPrivate::removeMarkerFile] Failed to remove marker file:" << path
+                    << "Error:" << file.errorString();
+        return false;
+    }
+
+    qInfo() << "[DiskEncryptSetupPrivate::removeMarkerFile] Marker file removed successfully:" << path;
     return true;
 }
 
 bool DiskEncryptSetupPrivate::removeOverlayDMFlagFile()
 {
-    static constexpr char kFlagFile[] { "/etc/usec-crypt/settings/overlay-dm" };
+    return removeMarkerFile(disk_encrypt::kOverlayDMFlagFile);
+}
 
-    qInfo() << "[DiskEncryptSetupPrivate::removeOverlayDMFlagFile] Removing overlay DM flag file";
-
-    QFile file(kFlagFile);
-    if (!file.exists()) {
-        qInfo() << "[DiskEncryptSetupPrivate::removeOverlayDMFlagFile] Flag file does not exist:" << kFlagFile;
-        return true;
-    }
-
-    if (!file.remove()) {
-        qCritical() << "[DiskEncryptSetupPrivate::removeOverlayDMFlagFile] Failed to remove flag file:" << kFlagFile
-                    << "Error:" << file.errorString();
-        return false;
-    }
-
-    qInfo() << "[DiskEncryptSetupPrivate::removeOverlayDMFlagFile] Flag file removed successfully:" << kFlagFile;
-    return true;
+bool DiskEncryptSetupPrivate::removeOverlayDMPendingFile()
+{
+    return removeMarkerFile(disk_encrypt::kOverlayDMPendingFile);
 }
 
 bool DiskEncryptSetupPrivate::updateInitramfs()
@@ -828,10 +913,36 @@ bool DiskEncryptSetupPrivate::updateInitramfs()
 
 void DiskEncryptSetupPrivate::syncConfigWithFileSystem()
 {
-    static constexpr char kFlagFile[] { "/etc/usec-crypt/settings/overlay-dm" };
-
     if (!config) {
         qWarning() << "[DiskEncryptSetupPrivate::syncConfigWithFileSystem] DConfig is null, cannot sync";
+        return;
+    }
+
+    // Detect interrupted operation: if the pending marker still exists, the
+    // previous enable/disable was killed mid-way (e.g. user rebooted before
+    // initramfs finished). The flag file and initramfs are both unreliable, so
+    // roll back to a consistent disabled state.
+    //
+    // Instead of emitting the signal directly here, set DConfig to false so the
+    // existing DConfig change signal triggers the normal async disable flow
+    // (handleOverlayDMModeChangeAsync → handleOverlayDMModeChange). The flag
+    // file removal and initramfs update are handled by that flow. The
+    // isRollbackFromInterrupted flag tells onOverlayDMModeChangeFinished to
+    // emit OverlayDMModeChanged with OverlayDMRolledBackInterrupted.
+    if (QFile::exists(disk_encrypt::kOverlayDMPendingFile)) {
+        qWarning() << "[DiskEncryptSetupPrivate::syncConfigWithFileSystem] Interrupted operation detected (pending marker exists), rolling back to disabled state";
+
+        isRollbackFromInterrupted = true;
+
+        // Setting DConfig to false triggers onConfigValueChanged which starts the
+        // normal async disable flow: removes the flag file and updates initramfs.
+        // The pending marker is NOT removed here — it is cleaned up by the exit
+        // paths of handleOverlayDMModeChange (which calls removeOverlayDMPendingFile
+        // on success/failure). This ensures crash-safety: if the process dies
+        // between setting DConfig and the async operation completing, the marker
+        // survives and the next startup will retry the rollback.
+        config->setValue("useOverlayDMMode", false);
+        qInfo() << "[DiskEncryptSetupPrivate::syncConfigWithFileSystem] DConfig set to false, rollback will proceed via async disable flow";
         return;
     }
 
@@ -839,7 +950,7 @@ void DiskEncryptSetupPrivate::syncConfigWithFileSystem()
     bool configValue = config->value("useOverlayDMMode", false).toBool();
 
     // 检查标志文件是否存在
-    bool flagFileExists = QFile::exists(kFlagFile);
+    bool flagFileExists = QFile::exists(disk_encrypt::kOverlayDMFlagFile);
 
     qInfo() << "[DiskEncryptSetupPrivate::syncConfigWithFileSystem] DConfig value:" << configValue
             << "Flag file exists:" << flagFileExists;
@@ -889,8 +1000,19 @@ void DiskEncryptSetupPrivate::onOverlayDMModeChangeFinished(bool success, bool t
 
     isHandlingConfigChange = false;
 
-    // Determine result code
-    int resultCode = success ? OverlayDMSuccess : OverlayDMFailedUpdateInitramfs;
+    // Determine result code: if this operation was triggered by a rollback from
+    // an interrupted state (syncConfigWithFileSystem detected a stale pending
+    // marker and set DConfig to false) and it succeeded, use the rollback result
+    // code so the upper layer can show an appropriate notification. If the
+    // rollback itself failed, fall through to the normal failure code.
+    int resultCode;
+    if (isRollbackFromInterrupted && success) {
+        resultCode = disk_encrypt::OverlayDMRolledBackInterrupted;
+        qInfo() << "[DiskEncryptSetupPrivate::onOverlayDMModeChangeFinished] This operation was a rollback from interrupted state";
+    } else {
+        resultCode = success ? disk_encrypt::OverlayDMSuccess : disk_encrypt::OverlayDMFailedUpdateInitramfs;
+    }
+    isRollbackFromInterrupted = false;
 
     if (!success) {
         qCritical() << "[DiskEncryptSetupPrivate::onOverlayDMModeChangeFinished] Mode change failed for target:" << targetValue;
@@ -911,6 +1033,9 @@ void DiskEncryptSetupPrivate::onOverlayDMModeChangeFinished(bool success, bool t
     // Emit DBus signal to notify upper layer application
     qInfo() << "[DiskEncryptSetupPrivate::onOverlayDMModeChangeFinished] Emitting DBus signal, enabled:" << targetValue
             << "result code:" << resultCode;
+
+    OverlayDMNotifyHelper::instance()->ensureNotificationDelivery(targetValue, resultCode);
+
     Q_EMIT qptr->OverlayDMModeChanged(targetValue, resultCode);
 
     // Check if there's a pending config change

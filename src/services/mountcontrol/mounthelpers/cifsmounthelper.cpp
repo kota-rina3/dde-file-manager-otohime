@@ -36,6 +36,29 @@ SERVICEMOUNTCONTROL_USE_NAMESPACE
 
 static constexpr char kPolicyKitActionIdCIFS[] { "org.deepin.Filemanager.MountController.CIFS" };
 
+// SMB share names may legally contain '#', but QUrl treats '#' as a fragment delimiter and
+// truncates it from smbUrl.path(), so the kernel mount UNC would lose the '#' and target a
+// non-existent share (BUG-373045). Merge any fragment back into the path to preserve the
+// share name. This is a no-op for URLs without a fragment, including the already-percent-
+// encoded form produced by networkAccessPrehandler (BUG-337999's fix) and '%20'-style
+// encoded paths, so existing behavior (and the BUG-337999 fix) is unchanged.
+//
+// 当 '#' 紧跟 host（如 smb://1.2.3.4#share/）时 url.path() 为空，需补前导 '/'
+// 否则 QUrl::setPath 会生成无效 URL。同时合并 fragment 后需清除旧 fragment，
+// 否则 URL 会同时包含合并后的 path 和旧 fragment。
+static QUrl mergedSmbUrl(const QString &path)
+{
+    QUrl url(path);
+    if (url.hasFragment()) {
+        auto p = url.path();
+        if (p.isEmpty())
+            p = "/";
+        url.setPath(p + '#' + url.fragment(QUrl::FullyDecoded));
+        url.setFragment({});
+    }
+    return url;
+}
+
 CifsMountHelper::CifsMountHelper(QDBusContext *context)
     : AbstractMountHelper(context), d(new CifsMountHelperPrivate()) { }
 
@@ -50,7 +73,7 @@ QVariantMap CifsMountHelper::mount(const QString &path, const QVariantMap &opts)
                  { kErrorMessage, "smb is only supported scheme now" } };
     }
 
-    QUrl smbUrl(path);
+    QUrl smbUrl = mergedSmbUrl(path);
     int port = smbUrl.port();
     const QString &share = smbUrl.path();
     const QString &host = smbUrl.host();
@@ -160,7 +183,7 @@ QVariantMap CifsMountHelper::unmount(const QString &path, const QVariantMap &opt
     Q_UNUSED(opts);
     using namespace MountReturnField;
 
-    QUrl smbUrl(path);
+    QUrl smbUrl = mergedSmbUrl(path);
     QString aPath = QString("//%1%2").arg(smbUrl.host()).arg(smbUrl.path());
 
     QString mpt;
@@ -189,8 +212,11 @@ QVariantMap CifsMountHelper::unmount(const QString &path, const QVariantMap &opt
     return { { kResult, ret == 0 }, { kErrorCode, err }, { kErrorMessage, errMsg } };
 }
 
-bool CifsMountHelper::checkAuthentication(const QString &appName)
+bool CifsMountHelper::checkAuthentication(const QString &appName, const uint callerID, const bool doMount, const QString &path)
 {
+    Q_UNUSED(callerID)
+    Q_UNUSED(doMount)
+    Q_UNUSED(path)
     return ServiceCommon::PolicyKitHelper::instance()->checkAuthorization(kPolicyKitActionIdCIFS, appName);
 }
 
@@ -249,7 +275,7 @@ QString CifsMountHelper::generateMountPath(const QString &address)
         return "";
 
     // assume that all address is like 'smb://1.2.3.4/share'
-    QUrl smbUrl(address);
+    QUrl smbUrl = mergedSmbUrl(address);
     QString host = smbUrl.host();
     QString path = smbUrl.path().mid(1);   // remove first /
     int port = smbUrl.port();
